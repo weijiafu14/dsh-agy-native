@@ -29,7 +29,6 @@ export const Config = z.object({
     .natural()
     .min(1)
     .max(64)
-    .optional()
     .volatile()
     .hidden()
     .description('Deprecated: sessions are multiplexed over one ACP transport without a slot cap.'),
