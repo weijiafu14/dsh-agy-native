@@ -92,6 +92,7 @@ interface JsonRpcRequest {
 /** Per-ACP-session tool registration handle on the shared loopback MCP server. */
 export class McpSessionEndpoint {
   readonly token: string;
+  readonly path = `/mcp/${crypto.randomUUID()}`;
   readonly #url: string;
   readonly #maxToolOutputBytes: number;
   readonly #batchWindowMs: number;
@@ -130,7 +131,7 @@ export class McpSessionEndpoint {
     return {
       type: 'http',
       name: MCP_SERVER_NAME,
-      url: this.#url,
+      url: new URL(this.path, this.#url).href,
       headers: [{ name: TOKEN_HEADER, value: this.token }],
     };
   }
@@ -419,7 +420,7 @@ export class LoopbackMcpBridge {
     const rawToken = req.headers[TOKEN_HEADER];
     const token = Array.isArray(rawToken) ? rawToken[0] : rawToken;
     const endpoint = token ? this.#endpoints.get(token) : undefined;
-    if (!endpoint) {
+    if (!endpoint || req.url !== endpoint.path) {
       res.writeHead(401, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized MCP session token' }));
       return;
@@ -443,6 +444,10 @@ export class LoopbackMcpBridge {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
     req.on('end', () => {
+      if (this.#endpoints.get(endpoint.token) !== endpoint) {
+        res.writeHead(401).end();
+        return;
+      }
       try {
         const body = Buffer.concat(chunks).toString('utf8');
         const parsed = JSON.parse(body) as JsonRpcRequest | JsonRpcRequest[];

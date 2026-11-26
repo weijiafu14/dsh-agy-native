@@ -25,20 +25,13 @@ export const Config = z.object({
     .default('')
     .volatile()
     .description('Optional working directory passed to `agy acp` (leave empty to use an isolated temp directory).'),
-  poolSize: z
-    .natural()
-    .min(1)
-    .max(8)
-    .default(2)
-    .volatile()
-    .description('Maximum concurrent warm ACP conversation workers.'),
   idleMinutes: z
     .natural()
     .min(0)
     .max(1440)
     .default(60)
     .volatile()
-    .description('Minutes of inactivity before an idle ACP worker is recycled (0 = keep warm indefinitely).'),
+    .description('Minutes of inactivity before an idle ACP session is closed (0 = keep warm indefinitely).'),
   batchWindowMs: z
     .natural()
     .min(0)
@@ -104,7 +97,6 @@ export function resolveAgyAcpConfig(raw: RawPluginConfig = {}): ResolvedAgyAcpCo
       ? plain.workingDirectory.trim()
       : undefined;
 
-  const poolSize = Math.min(8, Math.max(1, Number(plain.poolSize ?? 2) || 2));
   const idleMinutes = Math.max(0, Number(plain.idleMinutes ?? 60));
   const idleTtlMs = Number.isFinite(idleMinutes) ? Math.round(idleMinutes * 60_000) : 3_600_000;
   const batchWindowMs = Math.min(500, Math.max(0, Number(plain.batchWindowMs ?? 25)));
@@ -123,7 +115,6 @@ export function resolveAgyAcpConfig(raw: RawPluginConfig = {}): ResolvedAgyAcpCo
     providerName,
     agyPath,
     workingDirectory,
-    poolSize,
     idleTtlMs,
     batchWindowMs,
     startupTimeoutMs,

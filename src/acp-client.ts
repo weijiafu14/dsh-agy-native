@@ -115,10 +115,12 @@ export class AcpWorkerClient {
   #closeError?: Error;
   #capabilities?: AcpAgentCapabilitiesSummary;
 
-  #activeEndpoint?: McpSessionEndpoint;
-  #streamCallbacks?: AcpStreamCallbacks;
-  #suppressUpdatesDepth = 0;
-  #activePrompt?: { rpcId: number; sessionId: string };
+  readonly #sessions = new Map<string, {
+    endpoint?: McpSessionEndpoint;
+    callbacks?: AcpStreamCallbacks;
+    promptId?: number;
+  }>();
+  #starting?: Promise<AcpAgentCapabilitiesSummary>;
 
   constructor(opts: {
     agyPath: string;
@@ -155,6 +157,10 @@ export class AcpWorkerClient {
       throw this.#closeError ?? new Error('dsh-agy-native: worker client already closed');
     }
 
+    return this.#starting ??= this.#initialize();
+  }
+
+  async #initialize(): Promise<AcpAgentCapabilitiesSummary> {
     const args = ['acp', '--stdio', ...this.#extraArgs];
     const proc = spawn(this.#agyPath, args, {
       cwd: this.#cwd,
@@ -230,7 +236,6 @@ export class AcpWorkerClient {
     cwd?: string;
   }): Promise<AcpNewSessionResult> {
     await this.start();
-    this.#activeEndpoint = opts.endpoint;
 
     const hasTools = Boolean(opts.endpoint?.hasTools);
     const mcpServers = hasTools && opts.endpoint ? [opts.endpoint.toAcpMcpServerConfig()] : [];
@@ -261,6 +266,7 @@ export class AcpWorkerClient {
       };
     };
 
+    this.#sessions.set(res.sessionId, { endpoint: opts.endpoint });
     return {
       sessionId: res.sessionId,
       currentModelId: res.models?.currentModelId,
@@ -279,7 +285,6 @@ export class AcpWorkerClient {
     cwd?: string;
   }): Promise<void> {
     await this.start();
-    this.#activeEndpoint = opts.endpoint;
     const hasTools = Boolean(opts.endpoint?.hasTools);
     const mcpServers = hasTools && opts.endpoint ? [opts.endpoint.toAcpMcpServerConfig()] : [];
 
@@ -288,7 +293,8 @@ export class AcpWorkerClient {
       eagerMcpServers: hasTools ? [MCP_SERVER_NAME] : [],
     };
 
-    this.#suppressUpdatesDepth++;
+    if (this.#sessions.has(opts.sessionId)) throw new Error('ACP session is already attached');
+    this.#sessions.set(opts.sessionId, { endpoint: opts.endpoint });
     try {
       await this.#rpc(
         'session/load',
@@ -300,8 +306,9 @@ export class AcpWorkerClient {
         },
         this.#startupTimeoutMs,
       );
-    } finally {
-      this.#suppressUpdatesDepth = Math.max(0, this.#suppressUpdatesDepth - 1);
+    } catch (error) {
+      this.#sessions.delete(opts.sessionId);
+      throw error;
     }
   }
 
@@ -309,17 +316,14 @@ export class AcpWorkerClient {
     await this.#rpc('session/set_model', { sessionId, modelId: rawModelId }, this.#startupTimeoutMs);
   }
 
-  setStreamCallbacks(callbacks: AcpStreamCallbacks | undefined): void {
-    this.#streamCallbacks = callbacks;
-  }
-
-  setActiveEndpoint(endpoint: McpSessionEndpoint | undefined): void {
-    this.#activeEndpoint = endpoint;
+  setStreamCallbacks(sessionId: string, callbacks?: AcpStreamCallbacks): void {
+    const session = this.#sessions.get(sessionId);
+    if (session) session.callbacks = callbacks;
   }
 
   /**
    * Start `session/prompt` and return its completion promise. Note that when `agy` invokes
-   * an MCP tool on `#activeEndpoint`, this promise remains pending until all MCP tool calls
+   * an MCP tool on this session’s endpoint, this promise remains pending until all MCP tool calls
    * in the turn have resolved and `agy` finishes its final response (or is cancelled).
    */
   prompt(
@@ -328,7 +332,9 @@ export class AcpWorkerClient {
     timeoutMs?: number,
   ): Promise<AcpPromptResponse> {
     const nextRpcId = this.#rpcId + 1;
-    this.#activePrompt = { rpcId: nextRpcId, sessionId };
+    const session = this.#sessions.get(sessionId);
+    if (!session) return Promise.reject(new Error('ACP session is not attached'));
+    session.promptId = nextRpcId;
     return (
       this.#rpc(
         'session/prompt',
@@ -339,8 +345,8 @@ export class AcpWorkerClient {
         timeoutMs,
       ) as Promise<AcpPromptResponse>
     ).finally(() => {
-      if (this.#activePrompt?.rpcId === nextRpcId) {
-        this.#activePrompt = undefined;
+      if (session.promptId === nextRpcId) {
+        session.promptId = undefined;
       }
     });
   }
@@ -359,6 +365,7 @@ export class AcpWorkerClient {
   }
 
   async closeSession(sessionId: string): Promise<void> {
+    this.#sessions.delete(sessionId);
     if (!this.alive) return;
     try {
       await this.#rpc('session/close', { sessionId }, 3000);
@@ -368,7 +375,6 @@ export class AcpWorkerClient {
   }
 
   async dispose(): Promise<void> {
-    if (this.#closed) return;
     this.#handleFatalClose(new Error('dsh-agy-native: worker disposed'));
     const proc = this.#proc;
     this.#proc = undefined;
@@ -425,13 +431,15 @@ export class AcpWorkerClient {
   }
 
   #handleIncomingMessage(msg: JsonRpcWireMessage): void {
+    const sessionId = msg.params?.sessionId;
+    const session = typeof sessionId === 'string' ? this.#sessions.get(sessionId) : undefined;
     if (msg.method === 'session/request_permission') {
       const params = (msg.params ?? {}) as {
         toolCall?: { name?: string; rawInput?: Record<string, unknown> };
         options?: Array<{ kind?: string; optionId?: string }>;
       };
       const allowed = Boolean(
-        this.#activeEndpoint?.isAllowedPermissionRequest(
+        session?.endpoint?.isAllowedPermissionRequest(
           params.toolCall?.name,
           params.toolCall?.rawInput,
         ),
@@ -452,7 +460,7 @@ export class AcpWorkerClient {
     }
 
     if (msg.method === 'session/update') {
-      if (this.#suppressUpdatesDepth > 0) return;
+      if (!session || typeof sessionId !== 'string' || session.promptId === undefined) return;
       const update = (msg.params?.update ?? {}) as {
         sessionUpdate?: string;
         content?: { type?: string; text?: string };
@@ -461,31 +469,20 @@ export class AcpWorkerClient {
       };
       const kind = update.sessionUpdate;
       if (kind === 'agent_thought_chunk' && update.content?.type === 'text' && update.content.text) {
-        this.#streamCallbacks?.onThoughtDelta?.(update.content.text);
+        session.callbacks?.onThoughtDelta?.(update.content.text);
         return;
       }
       if (kind === 'agent_message_chunk' && update.content?.type === 'text' && update.content.text) {
         const upstreamError = classifyInBandAgyApiError(update.content.text);
         if (upstreamError) {
           // Trip circuit breaker immediately on attempt 1 so `agy` never hammers Google 7 more times
-          const active = this.#activePrompt;
-          const targetSessionId =
-            (typeof msg.params?.sessionId === 'string' ? msg.params.sessionId : undefined) ??
-            active?.sessionId;
-          if (targetSessionId) {
-            this.cancelPrompt(targetSessionId);
-          }
-          if (active) {
-            const pending = this.#pendingRpcs.get(active.rpcId);
-            if (pending) {
-              this.#pendingRpcs.delete(active.rpcId);
-              this.#activePrompt = undefined;
-              pending.reject(upstreamError);
-            }
-          }
+          this.cancelPrompt(sessionId);
+          const pending = this.#pendingRpcs.get(session.promptId);
+          this.#pendingRpcs.delete(session.promptId);
+          pending?.reject(upstreamError);
           return;
         }
-        this.#streamCallbacks?.onTextDelta?.(update.content.text);
+        session.callbacks?.onTextDelta?.(update.content.text);
         return;
       }
       if (
@@ -493,7 +490,7 @@ export class AcpWorkerClient {
         typeof update.used === 'number' &&
         typeof update.size === 'number'
       ) {
-        this.#streamCallbacks?.onUsageUpdate?.(update.used, update.size);
+        session.callbacks?.onUsageUpdate?.(update.used, update.size);
       }
       return;
     }
@@ -562,7 +559,8 @@ export class AcpWorkerClient {
     if (this.#closed) return;
     this.#closed = true;
     this.#closeError = error;
-    this.#activeEndpoint?.cancelAllPending(error.message);
+    for (const session of this.#sessions.values()) session.endpoint?.dispose();
+    this.#sessions.clear();
     for (const pending of this.#pendingRpcs.values()) {
       pending.reject(error);
     }

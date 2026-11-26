@@ -167,6 +167,14 @@ test('LoopbackMcpBridge enforces token auth and coalesces parallel tool calls in
     });
     assert.equal(unauth.status, 401);
 
+    const sibling = await bridge.createSessionEndpoint({ maxToolOutputBytes: 16384, batchWindowMs: 0 });
+    const wrongRoute = await fetch(sibling.toAcpMcpServerConfig().url, {
+      method: 'POST', headers: Object.fromEntries(cfg.headers.map(h => [h.name, h.value])),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
+    });
+    assert.equal(wrongRoute.status, 401);
+    sibling.dispose();
+
     // Send two concurrent tools/call requests within batchWindowMs
     const batches = [];
     endpoint.onNextBatch((batch) => batches.push(batch));
@@ -940,4 +948,33 @@ test('reconcileFinalStepUsage preserves exact cumulative billing while keeping f
   );
   assert.ok(fallbackUsage);
   assert.equal(fallbackUsage.inputTokens + (fallbackUsage.cacheReadTokens ?? 0), 183_000);
+});
+
+test('cold replay loads only current images and keeps consecutive teammate reports after the last tool result', async () => {
+  const text = value => ({ type: 'text', text: value });
+  const image = id => ({ type: 'image', attachment: { attachmentId: id, width: 10, height: 20 } });
+  const read = [];
+  const parts = await buildFullReplayPromptParts({
+    messages: [
+      { role: 'user', content: [image('old.png')] },
+      { role: 'assistant', content: [text('Checking')] },
+      { role: 'tool', toolCallId: 'a', content: [text('Checked'), image('tool.png')] },
+      { role: 'user', content: [text('Programmer report')] },
+      { role: 'developer', content: [text('Current team context')] },
+      { role: 'user', content: [text('Reviewer report'), image('current.png')] },
+      { role: 'user', content: [text('Coordinator report')] },
+    ],
+    loadImage: async ref => {
+      read.push(ref.attachmentId);
+      return { mimeType: 'image/png', base64: 'eA==' };
+    },
+  });
+  assert.deepEqual(read, ['current.png']);
+  assert.equal(parts.filter(p => p.type === 'image').length, 1);
+  const [history, current] = parts.map(p => p.text ?? '[pixels]').join('\n').split('<current_input>');
+  assert.match(history, /old\.png/);
+  assert.match(history, /tool\.png/);
+  assert.doesNotMatch(history, /report|pixels/);
+  assert.match(current, /Programmer report[\s\S]*Reviewer report[\s\S]*\[pixels\][\s\S]*Coordinator report/);
+  assert.equal(current.match(/<user_message>/g)?.length, 3);
 });

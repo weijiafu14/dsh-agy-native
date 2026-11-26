@@ -371,7 +371,9 @@ export async function buildIncrementalPromptParts(opts: {
   }
 
   for (const userMsg of humanUserMessages) {
+    if (humanUserMessages.length > 1) appendTextPart(parts, '<user_message>');
     await appendBlocksWithImages(parts, userMsg.content, opts.loadImage, opts.signal);
+    if (humanUserMessages.length > 1) appendTextPart(parts, '</user_message>');
   }
 
   if (parts.length === 0) {
@@ -381,8 +383,7 @@ export async function buildIncrementalPromptParts(opts: {
 }
 
 /**
- * Format an entire conversation history losslessly (preserving every historical tool call,
- * tool result, developer surface, and image block) when starting a fresh ACP session.
+ * Replay completed history as text and send current inputs with their live attachments.
  */
 export async function buildFullReplayPromptParts(opts: {
   messages: readonly RequestMessage[];
@@ -405,23 +406,11 @@ export async function buildFullReplayPromptParts(opts: {
     return parts;
   }
 
-  // Locate the start of the final human request cluster (ignoring trailing runtime notices)
-  let splitIdx = -1;
-  for (let i = nonSystem.length - 1; i >= 0; i--) {
-    const msg = nonSystem[i]!;
-    if (msg.role === 'user') {
-      const txt = blocksToPlainText(msg.content).trim();
-      const hasImage = msg.content.some((b) => b.type === 'image');
-      if (hasImage || !isEphemeralRuntimeNotice(txt)) {
-        splitIdx = i;
-        break;
-      }
-    } else {
-      break;
-    }
-  }
-  if (splitIdx < 0) {
-    splitIdx = Math.max(0, nonSystem.length - 1);
+  let splitIdx = nonSystem.length;
+  while (splitIdx > 0) {
+    const role = nonSystem[splitIdx - 1]!.role;
+    if (role === 'assistant' || role === 'tool') break;
+    splitIdx--;
   }
 
   if (splitIdx > 0) {
@@ -436,7 +425,7 @@ export async function buildFullReplayPromptParts(opts: {
         const hasImage = msg.content.some((b) => b.type === 'image');
         if (!hasImage && plain && isEphemeralRuntimeNotice(plain)) continue;
         appendTextPart(parts, '<user_turn>');
-        await appendBlocksWithImages(parts, msg.content, opts.loadImage, opts.signal);
+        appendTextPart(parts, plain);
         appendTextPart(parts, '</user_turn>');
       } else if (msg.role === 'developer') {
         const text = blocksToPlainText(msg.content).trim();
@@ -456,46 +445,15 @@ export async function buildFullReplayPromptParts(opts: {
     appendTextPart(parts, '</conversation_history>');
   }
 
-  // Emit trailing runtime context / developer context BEFORE the final human message so the
-  // human's actual prompt sits cleanly at the very end of the turn.
-  const currentHumanMsgs: RequestMessage[] = [];
-  const currentRuntimeNotices: string[] = [];
-
-  for (let i = splitIdx; i < nonSystem.length; i++) {
-    const msg = nonSystem[i]!;
-    if (msg.role === 'user') {
-      const plain = blocksToPlainText(msg.content).trim();
-      const hasImage = msg.content.some((b) => b.type === 'image');
-      if (!hasImage && plain && isEphemeralRuntimeNotice(plain)) {
-        currentRuntimeNotices.push(plain);
-      } else {
-        currentHumanMsgs.push(msg);
-      }
-    } else if (msg.role === 'developer') {
-      const text = blocksToPlainText(msg.content).trim();
-      if (text) appendTextPart(parts, `<developer_context>\n${text}\n</developer_context>`);
-    } else if (msg.role === 'tool') {
-      const toolMsg = msg as ToolResultMessage;
-      const text = blocksToPlainText(toolMsg.content);
-      appendTextPart(
-        parts,
-        `<tool_result id="${toolMsg.toolCallId}" status="${toolMsg.isError ? 'error' : 'ok'}">\n${text}\n</tool_result>`,
-      );
-    }
-  }
-
-  if (currentRuntimeNotices.length > 0) {
-    appendTextPart(
-      parts,
-      `<runtime_context>\n${currentRuntimeNotices.join('\n\n')}\n</runtime_context>`,
-    );
-  }
-
-  for (const userMsg of currentHumanMsgs) {
-    await appendBlocksWithImages(parts, userMsg.content, opts.loadImage, opts.signal);
-  }
-
-  return parts.length > 0 ? parts : [{ type: 'text', text: 'Continue.' }];
+  appendTextPart(parts, '<current_input>');
+  const current = await buildIncrementalPromptParts({
+    tailMessages: nonSystem.slice(splitIdx),
+    loadImage: opts.loadImage,
+    signal: opts.signal,
+  });
+  parts.push(...current);
+  appendTextPart(parts, '</current_input>');
+  return parts;
 }
 
 export type SessionSyncDecision =
@@ -533,6 +491,7 @@ export function planSessionSync(opts: {
   lastHistoryPrefixDigest?: string;
   pendingToolCallIds: ReadonlySet<string>;
   allowResumeFromReplay: boolean;
+  dshSessionId?: string;
   forwardContextUpdates: boolean;
 }): SessionSyncDecision {
   const { messages, pendingToolCallIds } = opts;
@@ -698,7 +657,11 @@ export function planSessionSync(opts: {
     };
   }
 
-  if (opts.allowResumeFromReplay && anchorReplay?.acpSessionId) {
+  // Forks can carry a parent's replay envelope. Rebuild from their own DSH history.
+  // A suspended tool turn also needs replay: its HTTP request died with the transport.
+  if (opts.allowResumeFromReplay && anchorReplay?.acpSessionId &&
+      anchorReplay.dshSessionId === opts.dshSessionId &&
+      !messages[anchorIdx]!.content.some(block => block.type === 'tool-call')) {
     return {
       kind: 'resume-incremental',
       resumeAcpSessionId: anchorReplay.acpSessionId,

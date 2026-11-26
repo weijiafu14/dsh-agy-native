@@ -4,7 +4,7 @@ import type {
   StreamChunk,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm';
-import { AcpWorkerClient, type AcpAgentCapabilitiesSummary } from './acp-client.js';
+import { AcpWorkerClient, type AcpAgentCapabilitiesSummary, type AcpStreamCallbacks } from './acp-client.js';
 import { resolveAgyBinary, supportsProcessPerSession } from './binary.js';
 import type { AgyModelCatalog } from './catalog.js';
 import {
@@ -264,17 +264,57 @@ export function reconcileFinalStepUsage(
   };
 }
 
-/**
- * One stateful ACP worker slot holding a persistent `agy acp --stdio` child process
- * and its active conversation session.
- */
-export class AgyWorkerSlot {
+/** Owns one ACP transport, including its initialization and crash replacement. */
+class SharedTransport {
+  #client?: AcpWorkerClient;
+  #opening?: Promise<AcpWorkerClient>;
+  #closed = false;
+
+  async get(cfg: ResolvedAgyAcpConfig): Promise<AcpWorkerClient> {
+    if (this.#closed) throw new Error('ACP transport disposed');
+    if (this.#opening) return this.#opening;
+    if (this.#client?.alive) return this.#client;
+    this.#opening = this.#open(cfg).finally(() => { this.#opening = undefined; });
+    return this.#opening;
+  }
+
+  async #open(cfg: ResolvedAgyAcpConfig): Promise<AcpWorkerClient> {
+    await this.#client?.dispose();
+    const agyPath = resolveAgyBinary(cfg.agyPath);
+    const client = new AcpWorkerClient({
+      agyPath,
+      cwd: cfg.workingDirectory,
+      startupTimeoutMs: cfg.startupTimeoutMs,
+      extraArgs: await supportsProcessPerSession(agyPath) ? ['--process-per-session'] : [],
+    });
+    this.#client = client;
+    try {
+      await client.start();
+      return client;
+    } catch (error) {
+      await client.dispose();
+      throw error;
+    }
+  }
+
+  async dispose(): Promise<void> {
+    this.#closed = true;
+    await this.#opening?.catch(() => {});
+    await this.#client?.dispose();
+  }
+}
+
+/** Session-local stream, bridge and replay state. */
+export class SessionRuntime {
   readonly id: string;
   readonly #getConfig: () => ResolvedAgyAcpConfig;
   readonly #mcpBridge: LoopbackMcpBridge;
   readonly #catalog: AgyModelCatalog;
   readonly #loadImage?: ImageBytesLoader;
 
+  readonly #transport: SharedTransport;
+  readonly #ownsTransport: boolean;
+  readonly #onIdle?: () => void;
   #client?: AcpWorkerClient;
   #endpoint?: McpSessionEndpoint;
   #activeAcpSessionId?: string;
@@ -285,7 +325,6 @@ export class AgyWorkerSlot {
   #cachedPromptBaseline = 0;
   #inFlightPrompt?: Promise<AcpPromptResponse>;
   #inFlightTurnUsage?: InFlightTurnUsageState;
-  #inFlightError?: Error;
 
   #busy = false;
   #lastUsedAt = Date.now();
@@ -294,12 +333,17 @@ export class AgyWorkerSlot {
 
   constructor(opts: {
     id: string;
+    transport?: SharedTransport;
+    onIdle?: () => void;
     getConfig: () => ResolvedAgyAcpConfig;
     mcpBridge: LoopbackMcpBridge;
     catalog: AgyModelCatalog;
     loadImage?: ImageBytesLoader;
   }) {
     this.id = opts.id;
+    this.#transport = opts.transport ?? new SharedTransport();
+    this.#ownsTransport = !opts.transport;
+    this.#onIdle = opts.onIdle;
     this.#getConfig = opts.getConfig;
     this.#mcpBridge = opts.mcpBridge;
     this.#catalog = opts.catalog;
@@ -369,11 +413,8 @@ export class AgyWorkerSlot {
 
     try {
       const client = await this.#ensureClient(cfg);
-      const endpoint = await this.#ensureEndpoint(cfg);
-      endpoint.setTools(options.tools);
-      client.setActiveEndpoint(endpoint);
 
-      const pendingIds = new Set(endpoint.getPendingCalls().map((c) => c.toolCallId));
+      const pendingIds = new Set(this.#endpoint?.getPendingCalls().map((c) => c.toolCallId));
       const syncPlan = planSessionSync({
         messages: options.messages,
         activeAcpSessionId: this.#activeAcpSessionId,
@@ -382,16 +423,41 @@ export class AgyWorkerSlot {
         lastContextDigests: this.#lastContextDigests,
         lastHistoryPrefixDigest: this.#lastHistoryPrefixDigest,
         pendingToolCallIds: pendingIds,
-        allowResumeFromReplay: cfg.resumeSessions,
+        allowResumeFromReplay: cfg.resumeSessions && !!options.sessionId && options.purpose === undefined,
+        dshSessionId: options.sessionId,
         forwardContextUpdates: cfg.forwardContextUpdates,
       });
 
+      if (syncPlan.kind !== 'resolve-pending-tools') {
+        const replace = syncPlan.kind !== 'warm-incremental';
+        await this.#abortInFlightTurn(replace);
+        if (replace) {
+          this.#endpoint?.dispose();
+          this.#endpoint = undefined;
+        }
+      }
+      let endpoint = await this.#ensureEndpoint(cfg);
+      endpoint.setTools(options.tools);
+      let resumed = false;
+      if (syncPlan.kind === 'resume-incremental' && client.capabilities?.loadSession) {
+        try {
+          await client.loadSession({ sessionId: syncPlan.resumeAcpSessionId, endpoint, cwd: cfg.workingDirectory });
+          this.#activeAcpSessionId = syncPlan.resumeAcpSessionId;
+          resumed = true;
+        } catch {
+          // Even a timed-out load may have received the URL. Revoke it before cold replay.
+          endpoint.dispose();
+          this.#endpoint = undefined;
+          endpoint = await this.#ensureEndpoint(cfg);
+          endpoint.setTools(options.tools);
+        }
+      }
       const queue = new AsyncEventQueue<TurnQueueEvent>();
       const detachBatch = endpoint.onNextBatch((calls) => {
         queue.push({ kind: 'tool-batch', calls });
       });
 
-      client.setStreamCallbacks({
+      const callbacks: AcpStreamCallbacks = {
         onThoughtDelta: (text) => queue.push({ kind: 'thought', text }),
         onTextDelta: (text) => queue.push({ kind: 'text', text }),
         onUsageUpdate: (used, size) => {
@@ -401,7 +467,7 @@ export class AgyWorkerSlot {
             this.#inFlightTurnUsage.lastStepUsed = used;
           }
         },
-      });
+      };
 
       const onAbort = () => {
         const reason =
@@ -416,15 +482,10 @@ export class AgyWorkerSlot {
       };
       options.signal?.addEventListener('abort', onAbort, { once: true });
 
+      let delivered = false;
       try {
         if (syncPlan.kind === 'resolve-pending-tools' && this.#inFlightPrompt) {
-          if (this.#inFlightError) {
-            const staleErr = this.#inFlightError;
-            this.#inFlightPrompt = undefined;
-            this.#inFlightTurnUsage = undefined;
-            this.#inFlightError = undefined;
-            throw staleErr;
-          }
+          client.setStreamCallbacks(this.#activeAcpSessionId!, callbacks);
           this.#attachPromptCompletion(this.#inFlightPrompt, queue);
           for (const res of syncPlan.resolutions) {
             endpoint.resolveToolCall(res.toolCallId, {
@@ -433,18 +494,15 @@ export class AgyWorkerSlot {
             });
           }
         } else {
-          // Tear down any abandoned in-flight turn before starting a fresh prompt
-          await this.#abortInFlightTurn(syncPlan.kind !== 'warm-incremental');
-
           const routingBridgeToolNames =
             options.purpose !== undefined && !endpoint.hasTools
               ? undefined
               : endpoint.bridgeToolNames;
 
           let promptParts;
-          if (syncPlan.kind === 'warm-incremental' && this.#activeAcpSessionId) {
-            if (this.#activeRawModelId !== targetRawModelId) {
-              await client.setModel(this.#activeAcpSessionId, targetRawModelId);
+          if (syncPlan.kind === 'warm-incremental' || (syncPlan.kind === 'resume-incremental' && resumed)) {
+            if (resumed || this.#activeRawModelId !== targetRawModelId) {
+              await client.setModel(this.#activeAcpSessionId!, targetRawModelId);
               this.#activeRawModelId = targetRawModelId;
             }
             promptParts = await buildIncrementalPromptParts({
@@ -453,42 +511,9 @@ export class AgyWorkerSlot {
               loadImage: this.#loadImage,
               signal: options.signal,
             });
-          } else if (syncPlan.kind === 'resume-incremental') {
-            let resumed = false;
-            if (client.capabilities?.loadSession) {
-              try {
-                await client.loadSession({
-                  sessionId: syncPlan.resumeAcpSessionId,
-                  endpoint,
-                  cwd: cfg.workingDirectory,
-                });
-                await client.setModel(syncPlan.resumeAcpSessionId, targetRawModelId);
-                this.#activeAcpSessionId = syncPlan.resumeAcpSessionId;
-                this.#activeRawModelId = targetRawModelId;
-                resumed = true;
-              } catch {
-                resumed = false;
-              }
-            }
             if (resumed) {
-              promptParts = await buildIncrementalPromptParts({
-                tailMessages: syncPlan.tailMessages,
-                updatedContextBlocks: syncPlan.updatedContextBlocks,
-                loadImage: this.#loadImage,
-                signal: options.signal,
-              });
-              // Loaded sessions may have been created by an older adapter.
               const routing = formatHarnessGuidelines(undefined, routingBridgeToolNames ?? false);
               if (routing) promptParts.unshift({ type: 'text', text: routing });
-            } else {
-              targetRawModelId = await this.#openFreshSession(client, endpoint, options, cfg);
-              promptParts = await buildFullReplayPromptParts({
-                messages: options.messages,
-                systemPrompt,
-                bridgeToolNames: routingBridgeToolNames,
-                loadImage: this.#loadImage,
-                signal: options.signal,
-              });
             }
           } else {
             targetRawModelId = await this.#openFreshSession(client, endpoint, options, cfg);
@@ -502,16 +527,13 @@ export class AgyWorkerSlot {
           }
 
           this.#inFlightTurnUsage = createInFlightTurnUsageState();
+          if (options.signal?.aborted) throw options.signal.reason;
+          client.setStreamCallbacks(this.#activeAcpSessionId!, callbacks);
           const promptPromise = client.prompt(
             this.#activeAcpSessionId!,
             promptParts,
             cfg.requestTimeoutMs > 0 ? cfg.requestTimeoutMs : undefined,
           );
-          // Prevent unhandled rejection if `agy` errors while suspended between DSH turns
-          this.#inFlightError = undefined;
-          promptPromise.catch((err: unknown) => {
-            this.#inFlightError = err instanceof Error ? err : new Error(String(err));
-          });
           this.#inFlightPrompt = promptPromise;
           this.#attachPromptCompletion(promptPromise, queue);
         }
@@ -544,6 +566,7 @@ export class AgyWorkerSlot {
           );
           const meta: AgyReplayMetadata = {
             version: 1,
+            dshSessionId: options.sessionId,
             acpSessionId: this.#activeAcpSessionId ?? '',
             rawModelId: targetRawModelId,
             syncedMessageCount: options.messages.length + 1,
@@ -640,6 +663,7 @@ export class AgyWorkerSlot {
               }
             }
 
+            delivered = true;
             yield {
               type: 'finish',
               reason: { kind: 'tool-calls' },
@@ -653,7 +677,6 @@ export class AgyWorkerSlot {
             const turnUsage = this.#inFlightTurnUsage;
             this.#inFlightTurnUsage = undefined;
             this.#inFlightPrompt = undefined;
-            this.#inFlightError = undefined;
             const closed = closeOpenBlock();
             if (closed) yield closed;
 
@@ -671,6 +694,7 @@ export class AgyWorkerSlot {
                 ? ({ kind: 'max-tokens' } as const)
                 : ({ kind: 'stop' } as const);
 
+            delivered = true;
             yield {
               type: 'finish',
               reason: stopReason,
@@ -683,7 +707,6 @@ export class AgyWorkerSlot {
           if (ev.kind === 'aborted') {
             this.#inFlightTurnUsage = undefined;
             this.#inFlightPrompt = undefined;
-            this.#inFlightError = undefined;
             queue.close();
             throw ev.reason;
           }
@@ -691,7 +714,6 @@ export class AgyWorkerSlot {
           if (ev.kind === 'error') {
             this.#inFlightTurnUsage = undefined;
             this.#inFlightPrompt = undefined;
-            this.#inFlightError = undefined;
             queue.close();
             throw ev.error;
           }
@@ -699,7 +721,13 @@ export class AgyWorkerSlot {
       } finally {
         options.signal?.removeEventListener('abort', onAbort);
         detachBatch();
-        client.setStreamCallbacks(undefined);
+        queue.close();
+        if (this.#activeAcpSessionId) client.setStreamCallbacks(this.#activeAcpSessionId);
+        if (!delivered) {
+          endpoint.dispose();
+          this.#endpoint = undefined;
+          await this.#abortInFlightTurn(true);
+        }
       }
     } finally {
       this.#busy = false;
@@ -714,33 +742,25 @@ export class AgyWorkerSlot {
     this.#endpoint = undefined;
     this.#inFlightTurnUsage = undefined;
     this.#inFlightPrompt = undefined;
-    this.#inFlightError = undefined;
+    const sessionId = this.#activeAcpSessionId;
     this.#clearActiveSessionState();
     const client = this.#client;
     this.#client = undefined;
-    if (client) {
-      await client.dispose();
-    }
+    if (sessionId) await client?.closeSession(sessionId);
+    if (this.#ownsTransport) await this.#transport.dispose();
   }
 
   async #ensureClient(cfg: ResolvedAgyAcpConfig): Promise<AcpWorkerClient> {
-    if (this.#client?.alive) return this.#client;
-    if (this.#client) {
-      await this.#client.dispose();
+    const client = await this.#transport.get(cfg);
+    if (client !== this.#client) {
+      this.#endpoint?.dispose();
+      this.#endpoint = undefined;
+      this.#clearActiveSessionState();
+      this.#inFlightPrompt = undefined;
+      this.#inFlightTurnUsage = undefined;
+      this.#client = client;
     }
-    this.#clearActiveSessionState();
-    this.#inFlightTurnUsage = undefined;
-    this.#inFlightPrompt = undefined;
-    this.#inFlightError = undefined;
-    const agyPath = resolveAgyBinary(cfg.agyPath);
-    this.#client = new AcpWorkerClient({
-      agyPath,
-      extraArgs: await supportsProcessPerSession(agyPath) ? ['--process-per-session'] : [],
-      cwd: cfg.workingDirectory,
-      startupTimeoutMs: cfg.startupTimeoutMs,
-    });
-    await this.#client.start();
-    return this.#client;
+    return client;
   }
 
   async #ensureEndpoint(cfg: ResolvedAgyAcpConfig): Promise<McpSessionEndpoint> {
@@ -768,6 +788,7 @@ export class AgyWorkerSlot {
       cwd: cfg.workingDirectory,
     });
 
+    this.#activeAcpSessionId = created.sessionId;
     if (created.availableModels.length > 0) {
       this.#catalog.update(created.availableModels, created.tier);
     }
@@ -790,7 +811,6 @@ export class AgyWorkerSlot {
       await client.setModel(created.sessionId, targetRawModelId);
     }
 
-    this.#activeAcpSessionId = created.sessionId;
     this.#activeRawModelId = targetRawModelId;
     return targetRawModelId;
   }
@@ -806,7 +826,6 @@ export class AgyWorkerSlot {
     }
     this.#inFlightTurnUsage = undefined;
     this.#inFlightPrompt = undefined;
-    this.#inFlightError = undefined;
     if (closeExistingSession) {
       if (this.#activeAcpSessionId && this.#client?.alive) {
         await this.#client.closeSession(this.#activeAcpSessionId);
@@ -841,10 +860,13 @@ export class AgyWorkerSlot {
 
   #scheduleIdleTimer(idleTtlMs: number): void {
     this.#clearIdleTimer();
-    if (idleTtlMs <= 0 || this.hasPendingToolTurn) return;
+    if (idleTtlMs <= 0) return;
     this.#idleTimer = setTimeout(() => {
       if (!this.#busy && !this.hasPendingToolTurn) {
+        this.#onIdle?.();
         void this.dispose();
+      } else {
+        this.#scheduleIdleTimer(idleTtlMs);
       }
     }, idleTtlMs);
     this.#idleTimer.unref?.();
@@ -858,150 +880,90 @@ export class AgyWorkerSlot {
   }
 }
 
-/**
- * Pool of warm `AgyWorkerSlot` instances with sticky DSH session affinity and
- * isolated auxiliary-call execution (so title generation never disrupts main sessions).
- */
+interface AgyPoolOptions {
+  getConfig: () => ResolvedAgyAcpConfig;
+  mcpBridge: LoopbackMcpBridge;
+  catalog: AgyModelCatalog;
+  loadImage?: ImageBytesLoader;
+}
+
+/** Multiplex independent DSH conversations over one long-lived ACP connection. */
 export class AgyWorkerPool {
-  readonly #getConfig: () => ResolvedAgyAcpConfig;
-  readonly #mcpBridge: LoopbackMcpBridge;
-  readonly #catalog: AgyModelCatalog;
-  readonly #loadImage?: ImageBytesLoader;
+  readonly #sessions = new Map<string | symbol, SessionRuntime>();
+  #transport = new SharedTransport();
+  readonly #locks = new Map<SessionRuntime, Promise<void>>();
+  readonly #opts: AgyPoolOptions;
+  #probe?: Promise<void>;
 
-  readonly #slots: AgyWorkerSlot[] = [];
-  #auxSlot?: AgyWorkerSlot;
-  #slotSeq = 0;
-
-  // Serialize turns targeting the exact same slot so concurrent requests queue cleanly
-  readonly #slotLocks = new Map<AgyWorkerSlot, Promise<void>>();
-
-  constructor(opts: {
-    getConfig: () => ResolvedAgyAcpConfig;
-    mcpBridge: LoopbackMcpBridge;
-    catalog: AgyModelCatalog;
-    loadImage?: ImageBytesLoader;
-  }) {
-    this.#getConfig = opts.getConfig;
-    this.#mcpBridge = opts.mcpBridge;
-    this.#catalog = opts.catalog;
-    this.#loadImage = opts.loadImage;
+  constructor(opts: AgyPoolOptions) {
+    this.#opts = opts;
   }
 
   async ensureCatalogLoaded(): Promise<void> {
-    if (this.#catalog.snapshot) return;
-    const slot = this.#acquireAuxSlot();
-    await this.#withSlotLock(slot, async () => {
-      await slot.probeCatalog();
-    });
+    if (this.#opts.catalog.snapshot) return;
+    return this.#probe ??= this.#probeCatalog().finally(() => { this.#probe = undefined; });
+  }
+
+  async #probeCatalog(): Promise<void> {
+    const probe = new SessionRuntime({ ...this.#opts, transport: this.#transport, id: 'catalog' });
+    try {
+      await probe.probeCatalog();
+    } finally {
+      await probe.dispose();
+    }
   }
 
   async *stream(options: GenerateOptions<string>): AsyncGenerator<StreamChunk> {
-    const slot = this.#selectSlot(options);
-    let releaseLock!: () => void;
-    const prevLock = this.#slotLocks.get(slot) ?? Promise.resolve();
-    const currentLock = new Promise<void>((resolve) => {
-      releaseLock = resolve;
-    });
-    this.#slotLocks.set(
-      slot,
-      prevLock.then(() => currentLock),
-    );
-
-    await prevLock;
-    try {
-      yield* slot.streamTurn(options);
-    } finally {
-      releaseLock();
-    }
-  }
-
-  async dispose(): Promise<void> {
-    const all = [...this.#slots, ...(this.#auxSlot ? [this.#auxSlot] : [])];
-    this.#slots.length = 0;
-    this.#auxSlot = undefined;
-    this.#slotLocks.clear();
-    await Promise.allSettled(all.map((s) => s.dispose()));
-  }
-
-  #acquireAuxSlot(): AgyWorkerSlot {
-    if (!this.#auxSlot) {
-      this.#auxSlot = new AgyWorkerSlot({
-        id: 'aux',
-        getConfig: this.#getConfig,
-        mcpBridge: this.#mcpBridge,
-        catalog: this.#catalog,
-        loadImage: this.#loadImage,
-      });
-    }
-    return this.#auxSlot;
-  }
-
-  #selectSlot(options: GenerateOptions<string>): AgyWorkerSlot {
-    // Auxiliary model calls (e.g. session title generation) use dedicated `#auxSlot`
-    if (options.purpose !== undefined) {
-      return this.#acquireAuxSlot();
-    }
-
-    // 1. Match by active ACP session stored in ReplayEnvelope (handles fork/resume/tool-continuation)
-    for (let i = options.messages.length - 1; i >= 0; i--) {
-      const meta = extractReplayMetadata(options.messages[i]!);
-      if (meta?.acpSessionId) {
-        const byAcpId = this.#slots.find((s) => s.activeAcpSessionId === meta.acpSessionId);
-        if (byAcpId) {
-          if (options.sessionId) byAcpId.setBoundKey(String(options.sessionId));
-          return byAcpId;
+    if (options.signal?.aborted) throw options.signal.reason;
+    await this.ensureCatalogLoaded();
+    let key: string | symbol = options.sessionId && options.purpose === undefined
+      ? String(options.sessionId) : Symbol('request');
+    // Unkeyed tool continuations can rejoin only another unkeyed request.
+    if (typeof key === 'symbol' && options.purpose === undefined) {
+      for (let i = options.messages.length - 1; i >= 0; i--) {
+        const replay = extractReplayMetadata(options.messages[i]!);
+        if (!replay) continue;
+        for (const [candidate, runtime] of this.#sessions) {
+          if (typeof candidate === 'symbol' && runtime.activeAcpSessionId === replay.acpSessionId) key = candidate;
         }
         break;
       }
     }
-
-    // 2. Match by DSH sessionId affinity
-    const sessionKey = options.sessionId ? String(options.sessionId) : undefined;
-    if (sessionKey) {
-      const bound = this.#slots.find((s) => s.boundKey === sessionKey);
-      if (bound) return bound;
-    }
-
-    // 3. Allocate new slot if pool has capacity
-    const maxSlots = Math.max(1, this.#getConfig().poolSize);
-    if (this.#slots.length < maxSlots) {
-      const created = new AgyWorkerSlot({
-        id: `worker-${++this.#slotSeq}`,
-        getConfig: this.#getConfig,
-        mcpBridge: this.#mcpBridge,
-        catalog: this.#catalog,
-        loadImage: this.#loadImage,
+    let slot = this.#sessions.get(key);
+    if (!slot) {
+      slot = new SessionRuntime({
+        ...this.#opts, transport: this.#transport, id: String(key),
+        onIdle: () => { this.#sessions.delete(key); },
       });
-      created.setBoundKey(sessionKey);
-      this.#slots.push(created);
-      return created;
+      this.#sessions.set(key, slot);
     }
-
-    // 4. Reuse least-recently-used idle slot without pending tool calls
-    const candidates = this.#slots.filter((s) => !s.busy && !s.hasPendingToolTurn);
-    const pool = candidates.length > 0 ? candidates : this.#slots;
-    const chosen = pool.reduce((oldest, cur) =>
-      cur.lastUsedAt < oldest.lastUsedAt ? cur : oldest,
-    );
-    chosen.setBoundKey(sessionKey);
-    return chosen;
-  }
-
-  async #withSlotLock<T>(slot: AgyWorkerSlot, fn: () => Promise<T>): Promise<T> {
+    const previous = this.#locks.get(slot);
     let release!: () => void;
-    const prev = this.#slotLocks.get(slot) ?? Promise.resolve();
-    const next = new Promise<void>((r) => {
-      release = r;
-    });
-    this.#slotLocks.set(
-      slot,
-      prev.then(() => next),
-    );
-    await prev;
+    const lock = new Promise<void>(resolve => { release = resolve; });
+    this.#locks.set(slot, lock);
+    await previous;
     try {
-      return await fn();
+      yield* slot.streamTurn(options);
     } finally {
       release();
+      if (this.#locks.get(slot) === lock) {
+        this.#locks.delete(slot);
+        if (typeof key === 'symbol' && !slot.hasPendingToolTurn) {
+          this.#sessions.delete(key);
+          await slot.dispose();
+        }
+      }
     }
   }
+
+  async dispose(): Promise<void> {
+    await Promise.allSettled([...this.#sessions.values()].map(slot => slot.dispose()));
+    this.#sessions.clear();
+    await this.#transport.dispose();
+    // The host can restart this adapter instance after disposal. Reopen lazily on first use.
+    this.#transport = new SharedTransport();
+  }
 }
+
+// Preserve the public constructor exported by ./core.
+export { SessionRuntime as AgyWorkerSlot };

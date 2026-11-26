@@ -20,10 +20,7 @@
 - **死守保号红线（100% 官方二进制出网 + 零 `systemInstruction` 污染 + 首轮熔断保护）**：包内**零**第三方 OAuth 客户端凭据、**零**私自发包逻辑；所有模型流量 100% 由本机官方签名的 `agy` 二进制通过标准 ACP (`agy acp --stdio`) 发出，**绝不开启** `excludeDefaultComponents: true` 且**绝不向 `systemInstruction` 注入第三方 Agent 身份提示词**（彻底避开 Cloud Code 边缘网关针对第三方系统提示词的假 `429` 拦截）；内置上游 `429/403` **第 1 次即刻熔断器**（立刻下发 `session/cancel` 阻断 `agy` 内置 8 次重试风暴并向 DSH 抛出不可重试错误），同时自动剥离环境变量中的 `GEMINI_API_KEY` / `GOOGLE_API_KEY` 防止误扣按量计费额度。
 - **一级原生工具直连 (`eagerMcpServers`)**：在 `127.0.0.1:0` 启动带 192-bit 随机令牌鉴权的 Streamable-HTTP MCP 反向桥，配合 `enabledTools: []` + `eagerMcpServers: ['dsh']` 关闭 `agy` 内置工具、将 DSH 工具作为一级原生工具直接挂载，彻底告别 `call_mcp_tool` 绕路与 2 KB 截断，并自动清洗 `agy` 注入的 `toolSummary` 字段以兼容严格 Schema。
 - **微批并发工具聚合**：在同一微批窗口（默认 `25ms`）内自动合并多个并发 `tools/call` 请求，一次性生成多条 `ToolCallBlock` 交由 DSH 并行执行。
-- **常驻 Worker 池 + Context OS 无损协同**：
-  - 默认 60 分钟空闲回收（可设 `0` 永不回收），告别 10 分钟断连失忆；
-  - 辅助请求（如自动生成会话标题 `session-title-llm`）自动隔离至独立 `#auxSlot`，绝不阻塞或驱逐正在进行的主对话；
-  - 基于 DSH 原生 `ReplayEnvelope` 记录回合锚点：即使 `dsh-context-os` 通过 `surfaceOp: 'replace'` 动态改写了前置上下文块，也不会打断热会话，而是将变更的上下文面增量同步给模型。
+- **共享 ACP 连接**：每个对话及辅助请求各用独立的 ACP 会话和经鉴权的 MCP 端点。默认 60 分钟后回收闲置会话。冷回放用文字描述历史图片，把最后一次模型回复或工具结果之后收到的消息全部作为当前输入。
 - **全模型家族、思考档位与多模态支持**：自动发现订阅账号下的全部模型与思考等级（涵盖 `Gemini 4 Neon` 含 `xhigh`、`Gemini 4 Carbon`、`Gemini 4 Argon`、`Gemini 4 Hydrogen` 含 `xhigh`、`Gemini 3.8 Flash`、`Claude Opus 5.5`、`Claude Sonnet 5.5`、`Orchestrator` 等），原生支持 DSH 图片块 (`ImageBlock`) 直传、流式思考块 (`reasoning`) 展示与精确的 `TokenUsage` 拆分统计，且使用 32 MiB JSON-RPC 帧缓冲（无 256 KiB 模型目录溢出或 56 KiB 输入截断限制）。
 
 ![dsh-agy-native 整体技术架构图](https://raw.githubusercontent.com/weijiafu14/dsh-agy-native/main/docs/architecture-overview.png)
@@ -79,8 +76,7 @@ dsh plugin --profile web add -w ./dsh-agy-native-0.2.0.tgz
 | `providerId` | `"agy-acp"` | 注册到 DSH `ctx.llm` 的 Provider 路由 ID。 |
 | `providerName` | `"Antigravity (AGY ACP)"` | 显示名称（探测到订阅等级后会自动显示为 `Antigravity (Google AI Ultra)` 等）。 |
 | `agyPath` | `""` | 官方 `agy` 可执行文件路径；留空自动从 `AGY_BIN`、`~/.local/bin/agy`、`PATH` 及标准安装目录发现。 |
-| `poolSize` | `2` | 最大并发常驻对话 Worker 数（`1–8`）。 |
-| `idleMinutes` | `60` | 空闲 Worker 回收分钟数（设为 `0` 则常驻不回收）。 |
+| `idleMinutes` | `60` | 空闲会话 回收分钟数（设为 `0` 则常驻不回收）。 |
 | `batchWindowMs` | `25` | 并发 MCP 工具调用的微批聚合窗口（毫秒）。 |
 | `maxToolOutputBytes` | `180000` | 单次工具输出返回给 `agy` 的 UTF-8 安全字节上限（防多字节截断乱码）。 |
 | `resumeSessions` | `true` | Worker 重启后优先尝试 `session/load` 恢复会话，失败时自动回退至保留完整工具历史的结构化重放。 |

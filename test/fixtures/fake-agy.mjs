@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 import { createInterface } from 'node:readline';
 
 if (process.argv.includes('--help')) {
@@ -27,10 +29,27 @@ async function callMcp(mcpServer, method, params) {
   return resp.json();
 }
 
+const permissions = new Map();
+let permissionSeq = 0;
+function permission(sessionId, name) {
+  const id = `perm-${++permissionSeq}`;
+  return new Promise(resolve => {
+    permissions.set(id, resolve);
+    send({ id, method: 'session/request_permission', params: {
+      sessionId, toolCall: { name },
+      options: ['allow_once', 'reject_once'].map(kind => ({ kind, optionId: kind })),
+    } });
+  });
+}
+
 rl.on('line', async (line) => {
   if (!line.trim()) return;
   const msg = JSON.parse(line);
-
+  if (permissions.has(msg.id)) {
+    permissions.get(msg.id)(msg.result.outcome.optionId);
+    permissions.delete(msg.id);
+    return;
+  }
   if (msg.method === 'initialize') {
     send({
       id: msg.id,
@@ -67,7 +86,7 @@ rl.on('line', async (line) => {
       });
       return;
     }
-    const sessionId = `fake-sess-${++sessionCounter}`;
+    const sessionId = `fake-sess-${process.pid}-${++sessionCounter}`;
     sessions.set(sessionId, {
       mcpServer: msg.params?.mcpServers?.[0],
       modelId: 'gemini-4-carbon-medium',
@@ -98,12 +117,20 @@ rl.on('line', async (line) => {
 
   if (msg.method === 'session/load') {
     const sessionId = msg.params.sessionId;
+    // The crash scenario saves one session. Other fixtures allow resuming any recorded ID.
+    if (fs.existsSync('saved-session') && fs.readFileSync('saved-session', 'utf8') !== sessionId) {
+      send({ id: msg.id, error: { code: -32000, message: 'No saved session' } });
+      return;
+    }
     const existing = sessions.get(sessionId);
     sessions.set(sessionId, {
       mcpServer: msg.params?.mcpServers?.[0] ?? existing?.mcpServer,
       modelId: existing?.modelId ?? 'gemini-4-carbon-medium',
       prompts: existing?.prompts ?? 1,
     });
+    send({ method: 'session/update', params: { sessionId, update: {
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'historical load event' },
+    } } });
     send({ id: msg.id, result: {} });
     return;
   }
@@ -156,6 +183,35 @@ rl.on('line', async (line) => {
         },
       },
     });
+
+    if (textJoined.includes('INSPECT_CURRENT_INPUT')) {
+      const current = textJoined.split('<current_input>').at(-1);
+      send({ method: 'session/update', params: { sessionId, update: {
+        sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: current },
+      } } });
+      send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      return;
+    }
+    if (textJoined.includes('SAVE_FOR_LOAD') && !fs.existsSync('saved-session')) fs.writeFileSync('saved-session', sessionId);
+    if (textJoined.includes('EXIT_FIXTURE_PROCESS')) process.exit(24);
+    const member = /CALL_PTC_MEMBER_(\d+)/.exec(textJoined)?.[1];
+    if (member !== undefined) {
+      const [own, foreign, unknown] = await Promise.all([
+        permission(sessionId, `mcp_dsh_member_${member}`),
+        permission(sessionId, `mcp_dsh_member_${Number(member) + 1}`),
+        permission('missing-session', 'mcp_dsh_run_code'),
+      ]);
+      const route = createHash('sha256').update(sess.mcpServer.url).digest('hex').slice(0, 16);
+      const reply = await callMcp(sess.mcpServer, 'tools/call', {
+        name: 'run_code', arguments: { member, route, pid: process.pid, own, foreign, unknown },
+      });
+      send({ method: 'session/update', params: { sessionId, update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `member=${member} result=${reply.result.content[0].text} active=${sessions.size}` },
+      } } });
+      send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      return;
+    }
 
     if (textJoined.includes('SIMULATE_UPSTREAM_429')) {
       send({

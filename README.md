@@ -19,7 +19,7 @@ Third-party OAuth proxies that impersonate Antigravity clients directly against 
 - **100% Official Binary Egress & Untouched `systemInstruction` (Zero OAuth Scraping)** — Every upstream model request is authenticated and sent exclusively by your locally installed, Google-signed `agy` binary over the Agent Client Protocol (`agy acp --stdio`). Official `systemInstruction` components remain 100% untouched (`excludeDefaultComponents` is never set and third-party persona prompts are never appended into `systemInstruction`), backed by an **attempt-1 upstream `429`/`403` circuit breaker** that immediately cancels `agy`'s internal 8-attempt retry loop to prevent retry storms.
 - **First-Class Eager DSH Tools (`eagerMcpServers`)** — Mounts a loopback-only (`127.0.0.1:0`) Streamable-HTTP MCP bridge with per-session cryptographic tokens so DSH tools appear to Gemini/Claude as native first-class tools (no `call_mcp_tool` lazy-loading indirection or 2 KB output truncation).
 - **Parallel Tool Micro-Batching & Argument Sanitization** — Coalesces concurrent MCP `tools/call` arrivals into unified DSH `ToolCallBlock` batches and strips `agy`-injected `toolSummary` fields to preserve `additionalProperties: false` schemas.
-- **Warm ACP Worker Pool + Context-OS Resilience** — Maintains warm conversation workers (no 10-minute idle kills), isolates auxiliary background requests (such as session title generation) onto a dedicated worker slot, and uses `ReplayEnvelope` turn anchors so dynamic context rewrites (e.g., `dsh-context-os` `surfaceOp: 'replace'`) never break warm sessions.
+- **Shared ACP transport** — Conversations and auxiliary requests have separate ACP session IDs and authenticated MCP endpoints. Idle cleanup closes individual sessions. Cold replay represents historical images as text and forwards all new messages after the last assistant or tool result.
 - **Full Model & Thinking Level Support** — Automatically discovers all models available to your subscription tier (`Gemini 4 Neon` including `xhigh`, `Gemini 4 Carbon`, `Gemini 4 Argon`, `Gemini 4 Hydrogen` including `xhigh`, `Gemini 3.8 Flash`, `Claude Opus 5.5`, `Claude Sonnet 5.5`, `Orchestrator`, etc.), native multimodal `ImageBlock` inputs, streaming `reasoning` chunks, and disjoint `TokenUsage` metrics.
 
 ---
@@ -77,11 +77,10 @@ Once enabled, select **Antigravity (Google AI Ultra / Pro)** in the DSH model pi
 | `providerId` | `"agy-acp"` | Provider route ID registered in `ctx.llm`. |
 | `providerName` | `"Antigravity (AGY ACP)"` | Display name in selectors (auto-enriched with subscription tier, e.g. `Antigravity (Google AI Ultra)`). |
 | `agyPath` | `""` | Explicit path to `agy`; auto-discovered from `AGY_BIN`, `~/.local/bin/agy`, `PATH`, or standard install paths when empty. |
-| `poolSize` | `2` | Maximum concurrent warm ACP conversation workers (`1–8`). |
-| `idleMinutes` | `60` | Minutes before recycling an idle worker (`0` keeps workers warm indefinitely). |
+| `idleMinutes` | `60` | Minutes before recycling an idle session (`0` keeps sessions warm indefinitely). |
 | `batchWindowMs` | `25` | Micro-batch window (ms) for coalescing concurrent MCP tool invocations. |
 | `maxToolOutputBytes` | `180000` | UTF-8 safe byte cap per tool output returned over the MCP bridge. |
-| `resumeSessions` | `true` | Attempt ACP `session/load` recovery across worker restarts before falling back to lossless structured transcript replay. |
+| `resumeSessions` | `true` | Attempt ACP `session/load` recovery across worker restarts before falling back to structured transcript replay. |
 | `forwardContextUpdates` | `true` | Forward mutated `developer` context surfaces incrementally without tearing down warm ACP sessions. |
 
 ---

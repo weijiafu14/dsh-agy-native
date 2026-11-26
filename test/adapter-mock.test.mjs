@@ -592,3 +592,91 @@ test('AgyAcpAdapter decomposes 6-step tool-loop usage so context occupancy stays
     fs.rmSync(tmpCache, { recursive: true, force: true });
   }
 });
+
+const user = text => ({ role: 'user', content: [{ type: 'text', text }] });
+function assistant(chunks) {
+  return {
+    id: 'reply', role: 'assistant',
+    content: chunks.filter(c => c.type === 'block-end').map(c => c.block),
+    source: { replayState: chunks.find(c => c.type === 'finish').replayState },
+  };
+}
+
+function muxFixture(t, idleTtlMs = 0) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-mux-'));
+  const cfg = { ...resolveAgyAcpConfig({ agyPath: FAKE_AGY_PATH, cacheDir: dir, workingDirectory: dir }), idleTtlMs };
+  const adapter = new AgyAcpAdapter({ getConfig: () => cfg });
+  t.after(async () => {
+    await adapter.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  return (sessionId, messages, tools = []) => collectChunks(adapter.stream({
+    provider: 'agy-acp', model: 'gemini-4-carbon', sessionId, messages, tools,
+  }));
+}
+
+test('eight interleaved sessions share one ACP child and isolate permissions, MCP routes, streams and results', { timeout: 12000 }, async t => {
+  const turn = muxFixture(t);
+  const members = Array.from({ length: 8 }, (_, i) => ({
+    session: 'team-' + i,
+    tools: ['run_code', 'member_' + i].map(name => ({ name, description: name, parameters: { type: 'object' } })),
+    messages: [user('CALL_PTC_MEMBER_' + i)],
+  }));
+  const calls = await Promise.all(members.map(async m => assistant(await turn(m.session, m.messages, m.tools))));
+  const routes = new Set(), pids = new Set(), sessions = new Set();
+  await Promise.all(members.map(async (m, i) => {
+    const reply = calls[i];
+    sessions.add(reply.source.replayState.response.acpSessionId);
+    const [call] = reply.content.filter(b => b.type === 'tool-call');
+    assert.equal(call.name, 'run_code');
+    const args = JSON.parse(call.arguments);
+    assert.equal(args.member, String(i));
+    assert.equal(args.own, 'allow_once');
+    assert.equal(args.foreign, 'reject_once');
+    assert.equal(args.unknown, 'reject_once');
+    routes.add(args.route);
+    pids.add(args.pid);
+    const result = { role: 'tool', toolCallId: call.id, content: [{ type: 'text', text: 'reply-' + i }] };
+    const final = assistant(await turn(m.session, [...m.messages, reply, result], m.tools));
+    assert.deepEqual(final.content, [{ type: 'text', text: `member=${i} result=reply-${i} active=8` }]);
+    assert.equal(final.source.replayState.response.acpSessionId, reply.source.replayState.response.acpSessionId);
+  }));
+  assert.equal(routes.size, 8);
+  assert.equal(sessions.size, 8);
+  assert.equal(pids.size, 1);
+});
+
+test('idle close releases just the idle session while a sibling MCP call waits for DSH', { timeout: 8000 }, async t => {
+  const turn = muxFixture(t, 60);
+  const tools = ['run_code', 'member_0'].map(name => ({ name, parameters: { type: 'object' } }));
+  const start = user('CALL_PTC_MEMBER_0');
+  const reply = assistant(await turn('waiting', [start], tools));
+  await turn('idle', [user('hello')]);
+  await new Promise(resolve => setTimeout(resolve, 240));
+  const call = reply.content.find(b => b.type === 'tool-call');
+  const final = assistant(await turn('waiting', [start, reply, {
+    role: 'tool', toolCallId: call.id, content: [{ type: 'text', text: 'survived' }],
+  }], tools));
+  assert.equal(final.content[0].text, 'member=0 result=survived active=1');
+});
+
+test('process loss restores saved sessions, cold-replays unavailable sessions, and isolates forks', { timeout: 9000 }, async t => {
+  const turn = muxFixture(t);
+  const first = user('SAVE_FOR_LOAD');
+  const saved = assistant(await turn('saved', [first]));
+  const other = assistant(await turn('other', [user('hello')]));
+  await assert.rejects(turn('crash', [user('EXIT_FIXTURE_PROCESS')]), /exited unexpectedly/);
+  const [resumed, rebuilt, fork] = await Promise.all([
+    turn('saved', [first, saved, user('continue')]),
+    turn('other', [user('hello'), other, user('member report A'), user('member report B'), user('INSPECT_CURRENT_INPUT')]),
+    turn('fork', [first, saved, user('forked')]),
+  ].map(p => p.then(assistant)));
+  const id = msg => msg.source.replayState.response.acpSessionId;
+  assert.equal(id(resumed), id(saved));
+  assert.notEqual(id(rebuilt), id(other));
+  assert.match(rebuilt.content.at(-1).text, /member report A[\s\S]*member report B/);
+  assert.doesNotMatch(rebuilt.content.at(-1).text, /hello/);
+  assert.notEqual(id(fork), id(saved));
+  assert.match(resumed.content.at(-1).text, /Turn=2/);
+  assert.ok(resumed.content.every(b => !b.text.includes('historical load event')));
+});

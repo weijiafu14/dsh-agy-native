@@ -91,6 +91,7 @@ export interface PendingMcpToolCall {
 /** Adapter-private state persisted inside DSH's `ReplayEnvelope.response`. */
 export interface AgyReplayMetadata {
   version: 1;
+  dshSessionId?: string;
   acpSessionId: string;
   rawModelId: string;
   syncedMessageCount: number;
@@ -106,7 +107,8 @@ export interface ResolvedAgyAcpConfig {
   providerName: string;
   agyPath?: string;
   workingDirectory?: string;
-  poolSize: number;
+  /** @deprecated Session concurrency is no longer capped by the adapter. */
+  poolSize?: number;
   idleTtlMs: number;
   batchWindowMs: number;
   startupTimeoutMs: number;
