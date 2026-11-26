@@ -279,7 +279,7 @@ export class McpSessionEndpoint {
       sendResult({
         protocolVersion: requestedVersion,
         capabilities: { tools: {} },
-        serverInfo: { name: MCP_SERVER_NAME, version: '0.2.0' },
+        serverInfo: { name: MCP_SERVER_NAME, version: '0.2.1' },
       });
       return;
     }
