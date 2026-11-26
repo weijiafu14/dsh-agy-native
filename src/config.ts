@@ -25,6 +25,14 @@ export const Config = z.object({
     .default('')
     .volatile()
     .description('Optional working directory passed to `agy acp` (leave empty to use an isolated temp directory).'),
+  poolSize: z
+    .natural()
+    .min(1)
+    .max(64)
+    .optional()
+    .volatile()
+    .hidden()
+    .description('Deprecated: sessions are multiplexed over one ACP transport without a slot cap.'),
   idleMinutes: z
     .natural()
     .min(0)

@@ -204,11 +204,13 @@ test('LoopbackMcpBridge enforces token auth and coalesces parallel tool calls in
     await new Promise((r) => setTimeout(r, 60));
     assert.equal(batches.length, 1, 'Expected both calls coalesced into a single batch');
     assert.equal(batches[0].length, 2);
-    assert.equal(batches[0][0].argumentsJson, '{"id":"1"}');
-    assert.equal(batches[0][1].argumentsJson, '{"id":"2"}');
+    const itemA = batches[0].find((c) => c.toolName === 'read_a');
+    const itemB = batches[0].find((c) => c.toolName === 'read_b');
+    assert.equal(itemA?.argumentsJson, '{"id":"1"}');
+    assert.equal(itemB?.argumentsJson, '{"id":"2"}');
 
-    endpoint.resolveToolCall(batches[0][0].toolCallId, { text: 'RES_A' });
-    endpoint.resolveToolCall(batches[0][1].toolCallId, { text: 'RES_B', isError: true });
+    endpoint.resolveToolCall(itemA.toolCallId, { text: 'RES_A' });
+    endpoint.resolveToolCall(itemB.toolCallId, { text: 'RES_B', isError: true });
 
     const [resA, resB] = await Promise.all([callA.then((r) => r.json()), callB.then((r) => r.json())]);
     assert.equal(resA.result.content[0].text, 'RES_A');
