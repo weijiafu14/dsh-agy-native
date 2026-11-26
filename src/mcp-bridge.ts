@@ -2,7 +2,11 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { ToolSchema } from '@deepseek-ai/dsh-llm';
-import type { PendingMcpToolCall } from './types.js';
+import type {
+  McpToolCallResolution,
+  McpToolResultContentItem,
+  PendingMcpToolCall,
+} from './types.js';
 
 export const MCP_SERVER_NAME = 'dsh';
 const TOKEN_HEADER = 'x-dsh-mcp-token';
@@ -103,6 +107,7 @@ export class McpSessionEndpoint {
   #callSeq = 0;
 
   readonly #pendingById = new Map<string, PendingMcpToolCall>();
+  readonly #dispatchedIds = new Set<string>();
   #stagingBatch: PendingMcpToolCall[] = [];
   #batchTimer?: NodeJS.Timeout;
   #batchListeners: Array<(batch: PendingMcpToolCall[]) => void> = [];
@@ -164,6 +169,11 @@ export class McpSessionEndpoint {
     return [...this.#pendingById.values()];
   }
 
+  /** IDs of pending tool calls that have already been flushed to DSH (excludes staged stragglers). */
+  getDispatchedCallIds(): Set<string> {
+    return new Set(this.#dispatchedIds);
+  }
+
   getPendingCall(toolCallId: string): PendingMcpToolCall | undefined {
     return this.#pendingById.get(toolCallId);
   }
@@ -191,19 +201,32 @@ export class McpSessionEndpoint {
   /** Wait for the next coalesced batch of MCP tool calls during an active prompt turn. */
   onNextBatch(listener: (batch: PendingMcpToolCall[]) => void): () => void {
     this.#batchListeners.push(listener);
+    if (this.#stagingBatch.length > 0 && !this.#batchTimer) {
+      queueMicrotask(() => this.#flushBatch());
+    }
     return () => {
       const idx = this.#batchListeners.indexOf(listener);
       if (idx >= 0) this.#batchListeners.splice(idx, 1);
     };
   }
 
-  /** Resolve one suspended MCP tool call with DSH's `ToolResultMessage` content. */
-  resolveToolCall(toolCallId: string, result: { text: string; isError?: boolean }): boolean {
+  /** Resolve one suspended MCP tool call with DSH's `ToolResultMessage` content (text and/or images). */
+  resolveToolCall(toolCallId: string, result: McpToolCallResolution): boolean {
     const pending = this.#pendingById.get(toolCallId);
     if (!pending) return false;
     this.#pendingById.delete(toolCallId);
+    this.#dispatchedIds.delete(toolCallId);
+    const rawItems: readonly McpToolResultContentItem[] =
+      result.content && result.content.length > 0
+        ? result.content
+        : [{ type: 'text', text: result.text ?? '' }];
+    const content: McpToolResultContentItem[] = rawItems.map((item) =>
+      item.type === 'text'
+        ? { type: 'text', text: truncateToolOutputUtf8(item.text, this.#maxToolOutputBytes) }
+        : item,
+    );
     pending.resolve({
-      text: truncateToolOutputUtf8(result.text, this.#maxToolOutputBytes),
+      content,
       isError: result.isError,
     });
     return true;
@@ -216,6 +239,7 @@ export class McpSessionEndpoint {
       this.#batchTimer = undefined;
     }
     this.#stagingBatch = [];
+    this.#dispatchedIds.clear();
     for (const pending of this.#pendingById.values()) {
       pending.cancel(reason);
     }
@@ -296,12 +320,15 @@ export class McpSessionEndpoint {
         toolName: schema.name,
         argumentsJson,
         receivedAt: Date.now(),
-        resolve: ({ text, isError }) => {
+        resolve: ({ content, text, isError }) => {
           if (settled) return;
           settled = true;
           this.#pendingById.delete(toolCallId);
+          this.#dispatchedIds.delete(toolCallId);
+          const items: readonly McpToolResultContentItem[] =
+            content && content.length > 0 ? content : [{ type: 'text', text: text ?? '' }];
           sendResult({
-            content: [{ type: 'text', text }],
+            content: items,
             ...(isError ? { isError: true } : {}),
           });
         },
@@ -309,6 +336,7 @@ export class McpSessionEndpoint {
           if (settled) return;
           settled = true;
           this.#pendingById.delete(toolCallId);
+          this.#dispatchedIds.delete(toolCallId);
           sendError(-32800, reason);
         },
       };
@@ -317,6 +345,7 @@ export class McpSessionEndpoint {
         if (!settled) {
           settled = true;
           this.#pendingById.delete(toolCallId);
+          this.#dispatchedIds.delete(toolCallId);
         }
       });
 
@@ -343,9 +372,13 @@ export class McpSessionEndpoint {
   }
 
   #flushBatch(): void {
-    if (this.#stagingBatch.length === 0) return;
-    const batch = this.#stagingBatch;
+    if (this.#stagingBatch.length === 0 || this.#batchListeners.length === 0) return;
+    const batch = this.#stagingBatch.filter((call) => this.#pendingById.has(call.toolCallId));
     this.#stagingBatch = [];
+    if (batch.length === 0) return;
+    for (const call of batch) {
+      this.#dispatchedIds.add(call.toolCallId);
+    }
     for (const listener of [...this.#batchListeners]) {
       listener(batch);
     }

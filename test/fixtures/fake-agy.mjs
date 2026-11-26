@@ -285,6 +285,43 @@ rl.on('line', async (line) => {
           },
         },
       });
+    } else if (
+      textJoined.includes('CALL_STRAGGLER_TOOLS') &&
+      !textJoined.includes('<conversation_history>') &&
+      sess.mcpServer
+    ) {
+      // Fire call 1 at 0ms and call 2 at 55ms (crossing the 20ms batchWindowMs boundary)
+      const p1 = callMcp(sess.mcpServer, 'tools/call', {
+        name: 'get_left',
+        arguments: { q: 'FIRST' },
+      });
+      const p2 = new Promise((r) => setTimeout(r, 55)).then(() =>
+        callMcp(sess.mcpServer, 'tools/call', {
+          name: 'get_right',
+          arguments: { q: 'LATE' },
+        }),
+      );
+      const [r1, r2] = await Promise.all([p1, p2]);
+      if (sess.cancelled || r1?.error || r2?.error || !r1?.result || !r2?.result) {
+        send({ id: msg.id, result: { stopReason: 'cancelled' } });
+        return;
+      }
+      const c2Summary = r2.result.content
+        .map((item) => (item.type === 'image' ? `[mcp-img:${item.mimeType}:${item.data.length}]` : item.text))
+        .join('|BLOCK|');
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `Straggler=${sessionId}:T${sess.prompts}:${r1.result.content[0].text}+${c2Summary}`,
+            },
+          },
+        },
+      });
     } else if (textJoined.includes('CALL_SIX_STEP_LOOP') && sess.mcpServer) {
       // Simulate 5 sequential tool steps (~180k context each) + final step 6 (cumulative > 1M window!)
       for (let i = 1; i <= 5; i++) {

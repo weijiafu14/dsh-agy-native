@@ -62,11 +62,11 @@ export const Config = z.object({
     .description('Optional per-turn prompt timeout in milliseconds (0 = no adapter-imposed timeout; defer to DSH cancellation).'),
   maxToolOutputBytes: z
     .natural()
-    .min(4096)
-    .max(1048576)
-    .default(180000)
+    .min(0)
+    .max(67108864)
+    .default(0)
     .volatile()
-    .description('Maximum UTF-8 bytes per tool output returned over the MCP bridge before safe truncation.'),
+    .description('Optional UTF-8 byte cap per tool output over the MCP bridge (0 = unlimited; defer to DSH pagination and spill handling).'),
   resumeSessions: z
     .boolean()
     .default(true)
@@ -74,9 +74,9 @@ export const Config = z.object({
     .description('Attempt lossless ACP `session/load` recovery across worker restarts before falling back to structured transcript replay.'),
   forwardContextUpdates: z
     .boolean()
-    .default(true)
     .volatile()
-    .description('Forward mutated developer context surfaces (e.g. dsh-context-os replace ops) incrementally without resetting warm ACP sessions.'),
+    .hidden()
+    .description('Deprecated: prefix mutations now rebuild cleanly while in-history updates append at the tail.'),
 });
 
 export type RawPluginConfig = Record<string, unknown>;
@@ -109,12 +109,10 @@ export function resolveAgyAcpConfig(raw: RawPluginConfig = {}): ResolvedAgyAcpCo
   const batchWindowMs = Math.min(500, Math.max(0, Number(plain.batchWindowMs ?? 25)));
   const startupTimeoutMs = Math.max(3000, Number(plain.startupTimeoutMs ?? 30_000) || 30_000);
   const requestTimeoutMs = Math.max(0, Number(plain.requestTimeoutMs ?? 0) || 0);
-  const maxToolOutputBytes = Math.max(
-    4096,
-    Number(plain.maxToolOutputBytes ?? 180_000) || 180_000,
-  );
+  const rawMaxBytes = Number(plain.maxToolOutputBytes ?? 0);
+  const maxToolOutputBytes =
+    Number.isFinite(rawMaxBytes) && rawMaxBytes > 0 ? Math.floor(rawMaxBytes) : 0;
   const resumeSessions = plain.resumeSessions !== false;
-  const forwardContextUpdates = plain.forwardContextUpdates !== false;
   const cacheDir = typeof plain.cacheDir === 'string' ? plain.cacheDir : undefined;
 
   return {
@@ -128,7 +126,6 @@ export function resolveAgyAcpConfig(raw: RawPluginConfig = {}): ResolvedAgyAcpCo
     requestTimeoutMs,
     maxToolOutputBytes,
     resumeSessions,
-    forwardContextUpdates,
     cacheDir,
   };
 }

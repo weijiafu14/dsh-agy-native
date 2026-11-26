@@ -1,7 +1,7 @@
 import type { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 
 /** Recognized reasoning effort levels in ascending order of compute effort. */
-export const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh'] as const;
+export const EFFORT_ORDER = ['minimal', 'low', 'medium', 'high', 'extra', 'xhigh', 'max'] as const;
 export type AgyEffortSlug = (typeof EFFORT_ORDER)[number];
 
 /** Raw model entry advertised by `agy acp` in `session/new`. */
@@ -72,6 +72,25 @@ export interface AcpPromptResponse {
   usage?: AcpPromptUsage;
 }
 
+/** Content item returned inside an MCP `tools/call` response. */
+export type McpToolResultContentItem =
+  | {
+      type: 'text';
+      text: string;
+    }
+  | {
+      type: 'image';
+      data: string;
+      mimeType: string;
+    };
+
+/** Payload accepted when settling a pending MCP `tools/call` invocation. */
+export interface McpToolCallResolution {
+  content?: readonly McpToolResultContentItem[];
+  text?: string;
+  isError?: boolean;
+}
+
 /** Suspended MCP `tools/call` invocation awaiting DSH execution. */
 export interface PendingMcpToolCall {
   /** Stable DSH tool call ID correlated across assistant and tool messages. */
@@ -83,7 +102,7 @@ export interface PendingMcpToolCall {
   /** Timestamp when the MCP bridge received this invocation. */
   receivedAt: number;
   /** Resolve the suspended HTTP MCP call back to `agy`. */
-  resolve: (result: { text: string; isError?: boolean }) => void;
+  resolve: (result: McpToolCallResolution) => void;
   /** Reject/abort the suspended HTTP MCP call when cancelled or torn down. */
   cancel: (reason?: string) => void;
 }
@@ -97,7 +116,6 @@ export interface AgyReplayMetadata {
   syncedMessageCount: number;
   lastAnchorId?: string;
   toolsFingerprint: string;
-  contextDigests?: Record<string, string>;
   historyPrefixDigest?: string;
 }
 
@@ -115,7 +133,6 @@ export interface ResolvedAgyAcpConfig {
   requestTimeoutMs: number;
   maxToolOutputBytes: number;
   resumeSessions: boolean;
-  forwardContextUpdates: boolean;
   cacheDir?: string;
 }
 

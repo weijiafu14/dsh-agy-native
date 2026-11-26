@@ -10,8 +10,9 @@ import {
   McpSessionEndpoint,
   buildCatalogEntries,
   buildFullReplayPromptParts,
+  buildIncrementalPromptParts,
+  buildMcpToolResultContent,
   classifyInBandAgyApiError,
-  computeContextDigests,
   computeHistoryPrefixDigest,
   computeToolsFingerprint,
   createInFlightTurnUsageState,
@@ -19,8 +20,10 @@ import {
   encodeMcpToolName,
   estimateIntermediateStepUsage,
   formatHarnessGuidelines,
+  isAmbientContextMessage,
   planSessionSync,
   reconcileFinalStepUsage,
+  resolveAgyAcpConfig,
   resolveAgyBinary,
   sanitizeMcpToolArguments,
   supportsProcessPerSession,
@@ -60,6 +63,8 @@ test('AgyModelCatalog groups families, supports Hydrogen xhigh, and persists cac
       { modelId: 'gemini-4-carbon-low', name: 'Gemini 4 Carbon (Low)' },
       { modelId: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
       { modelId: 'gemini-4-hydrogen-xhigh', name: 'Gemini 4 Hydrogen (XHigh)' },
+      { modelId: 'gemini-4-hydrogen-max', name: 'Gemini 4 Hydrogen (Max)' },
+      { modelId: 'gemini-4-hydrogen-extra', name: 'Gemini 4 Hydrogen (Extra)' },
       { modelId: 'gemini-4-hydrogen-medium', name: 'Gemini 4 Hydrogen (Medium)' },
       { modelId: 'gemini-4-hydrogen-low', name: 'Gemini 4 Hydrogen (Low)' },
       { modelId: 'gemini-pro-orchestrator', name: 'Orchestrator (Carbon)' },
@@ -72,17 +77,24 @@ test('AgyModelCatalog groups families, supports Hydrogen xhigh, and persists cac
     const hydrogen = entries.find((e) => e.id === 'gemini-4-hydrogen');
     assert.ok(hydrogen);
     assert.equal(hydrogen.name, 'Gemini 4 Hydrogen');
-    assert.deepEqual([...hydrogen.effortToRawModelId.keys()], ['low', 'medium', 'high', 'xhigh']);
+    assert.deepEqual([...hydrogen.effortToRawModelId.keys()], ['low', 'medium', 'high', 'extra', 'xhigh', 'max']);
     assert.equal(hydrogen.defaultEffort, 'high');
 
     const catalog = new AgyModelCatalog(tmpDir);
     catalog.update(rawModels, { name: 'Google AI Ultra', id: 'ultra' });
 
     assert.equal(catalog.resolveRawModelId('gemini-4-hydrogen', 'xhigh'), 'gemini-4-hydrogen-xhigh');
+    assert.equal(catalog.resolveRawModelId('gemini-4-hydrogen', 'max'), 'gemini-4-hydrogen-max');
+    assert.equal(catalog.resolveRawModelId('gemini-4-hydrogen', 'extra'), 'gemini-4-hydrogen-extra');
     assert.equal(catalog.resolveRawModelId('gemini-4-carbon'), 'gemini-4-carbon-medium');
     assert.equal(catalog.resolveRawModelId('gemini-4-carbon-high'), 'gemini-4-carbon-high');
     assert.equal(catalog.resolveRawModelId('gemini-pro-orchestrator'), 'gemini-pro-orchestrator');
     assert.equal(catalog.resolveRawModelId('gpt-oss-120b-medium'), 'gpt-oss-120b-medium');
+
+    const resolvedCarbon = catalog.toResolvedModelInfo('agy-acp', 'gemini-4-carbon');
+    assert.equal(resolvedCarbon.systemPromptUpdate, 'in-history');
+    assert.equal(resolveAgyAcpConfig({}).maxToolOutputBytes, 0);
+    assert.equal(truncateToolOutputUtf8('x'.repeat(250_000), 0).length, 250_000);
 
     const reloaded = new AgyModelCatalog(tmpDir);
     assert.equal(reloaded.tier?.name, 'Google AI Ultra');
@@ -221,10 +233,16 @@ test('LoopbackMcpBridge enforces token auth and coalesces parallel tool calls in
   }
 });
 
-test('planSessionSync tolerates Context OS surfaceOp: replace and runtime notices without resetting session', async () => {
+test('planSessionSync preserves warm session on tail appends, resolves pending tools with separate context blocks, and rebuilds on prefix rewrites', async () => {
   const toolsFp = computeToolsFingerprint([{ name: 'bash', description: 'Run', parameters: {} }]);
 
   const initialMessages = [
+    {
+      id: 'sys-1',
+      role: 'system',
+      content: [{ type: 'text', text: 'You are a coding agent powered by the gemini-4-carbon model.\nFollow strict repo guidelines.' }],
+      source: { kind: 'system-prompt' },
+    },
     {
       id: 'dev-surface-1',
       role: 'developer',
@@ -238,17 +256,11 @@ test('planSessionSync tolerates Context OS surfaceOp: replace and runtime notice
       source: { kind: 'user' },
     },
   ];
-  const initialDigests = computeContextDigests(initialMessages);
+  const initialPrefixDigest = computeHistoryPrefixDigest(initialMessages, initialMessages.length);
 
-  // Assistant emitted a tool call; Context OS then replaced `dev-surface-1` AND DSH added runtime notice
+  // Assistant emitted a tool call; while tool ran, a background job finished (`tool-jobs`) AND clock snapshot arrived
   const midTurnMessages = [
-    {
-      id: 'dev-surface-1',
-      role: 'developer',
-      content: [{ type: 'text', text: 'Todo status: step 1 IN PROGRESS (mutated by Context OS)' }],
-      source: { kind: 'developer' },
-    },
-    initialMessages[1],
+    ...initialMessages,
     {
       id: 'asst-1',
       role: 'assistant',
@@ -261,9 +273,9 @@ test('planSessionSync tolerates Context OS surfaceOp: replace and runtime notice
             version: 1,
             acpSessionId: 'sess-live-1',
             rawModelId: 'gemini-4-carbon-medium',
-            syncedMessageCount: 3,
+            syncedMessageCount: 4,
             toolsFingerprint: toolsFp,
-            contextDigests: initialDigests,
+            historyPrefixDigest: initialPrefixDigest,
           },
         },
       },
@@ -272,14 +284,20 @@ test('planSessionSync tolerates Context OS surfaceOp: replace and runtime notice
       id: 'tool-res-1',
       role: 'tool',
       toolCallId: 'call_1',
-      content: [{ type: 'text', text: 'README.md\nsrc/' }],
+      content: [
+        { type: 'text', text: 'README.md\nsrc/' },
+        {
+          type: 'image',
+          attachment: { attachmentId: 'preview.png', mediaType: 'image/png', bytes: 32, width: 16, height: 16 },
+        },
+      ],
       source: { kind: 'tool' },
     },
     {
-      id: 'runtime-note-1',
+      id: 'job-done-1',
       role: 'user',
-      content: [{ type: 'text', text: 'Time sampled while preparing turn 2, step 3: 2026-11-18T17:00:00+08:00' }],
-      source: { kind: 'user' },
+      content: [{ type: 'text', text: 'background job bg-1 finished [status: exited(0)]. Output: OK' }],
+      source: { kind: 'tool-jobs', form: 'notice' },
     },
   ];
 
@@ -288,51 +306,72 @@ test('planSessionSync tolerates Context OS surfaceOp: replace and runtime notice
     activeAcpSessionId: 'sess-live-1',
     lastToolsFingerprint: toolsFp,
     currentToolsFingerprint: toolsFp,
-    lastContextDigests: initialDigests,
-    pendingToolCallIds: new Set(['call_1']),
+    lastHistoryPrefixDigest: initialPrefixDigest,
+    pendingToolCallIds: new Set(['call_1', 'call_2_still_running']),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
 
+  // Partial resolution works cleanly without resetting warm session!
   assert.equal(midTurnDecision.kind, 'resolve-pending-tools');
   assert.equal(midTurnDecision.resolutions.length, 1);
-  assert.equal(midTurnDecision.resolutions[0].text, 'README.md\nsrc/');
+  assert.equal(midTurnDecision.resolutions[0].toolCallId, 'call_1');
+  assert.deepEqual(midTurnDecision.resolutions[0].trailingNotes, [
+    'background job bg-1 finished [status: exited(0)]. Output: OK',
+  ]);
 
-  // Next turn: assistant finished, Context OS mutated `dev-surface-1` again, user sends Turn 2
+  // Multimodal MCP content keeps tool text, tool image, and trailing notice in separate MCP blocks!
+  const mcpItems = await buildMcpToolResultContent({
+    content: midTurnDecision.resolutions[0].content,
+    trailingNotes: midTurnDecision.resolutions[0].trailingNotes,
+    loadImage: async (ref) => ({ base64: `B64_${ref.attachmentId}`, mimeType: ref.mediaType }),
+  });
+  assert.equal(mcpItems.length, 3);
+  assert.deepEqual(mcpItems[0], { type: 'text', text: 'README.md\nsrc/' });
+  assert.deepEqual(mcpItems[1], { type: 'image', data: 'B64_preview.png', mimeType: 'image/png' });
+  assert.match(mcpItems[2].text, /<dsh_context_note>[\s\S]*bg-1 finished/);
+
+  // Turn 2: Assistant finished; tail appends developer update + human message + clock snapshot -> warm-incremental
+  const turn1History = [...midTurnMessages];
+  const turn1PrefixDigest = computeHistoryPrefixDigest(turn1History, turn1History.length);
+  const asstFinal1 = {
+    id: 'asst-final-1',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Found README.md and src/.' }],
+    source: {
+      provider: 'agy-acp',
+      model: 'gemini-4-carbon',
+      replayState: {
+        response: {
+          version: 1,
+          acpSessionId: 'sess-live-1',
+          rawModelId: 'gemini-4-carbon-medium',
+          syncedMessageCount: turn1History.length + 1,
+          toolsFingerprint: toolsFp,
+          historyPrefixDigest: turn1PrefixDigest,
+        },
+      },
+    },
+  };
   const turn2Messages = [
+    ...turn1History,
+    asstFinal1,
     {
-      id: 'dev-surface-1',
+      id: 'dev-tail-2',
       role: 'developer',
       content: [{ type: 'text', text: 'Todo status: step 1 COMPLETED, step 2 IN PROGRESS' }],
       source: { kind: 'developer' },
-    },
-    initialMessages[1],
-    midTurnMessages[2],
-    midTurnMessages[3],
-    {
-      id: 'asst-final-1',
-      role: 'assistant',
-      content: [{ type: 'text', text: 'Found README.md and src/.' }],
-      source: {
-        provider: 'agy-acp',
-        model: 'gemini-4-carbon',
-        replayState: {
-          response: {
-            version: 1,
-            acpSessionId: 'sess-live-1',
-            rawModelId: 'gemini-4-carbon-medium',
-            syncedMessageCount: 5,
-            toolsFingerprint: toolsFp,
-            contextDigests: initialDigests,
-          },
-        },
-      },
     },
     {
       id: 'user-2',
       role: 'user',
       content: [{ type: 'text', text: 'Now read README.md' }],
       source: { kind: 'user' },
+    },
+    {
+      id: 'clock-2',
+      role: 'user',
+      content: [{ type: 'text', text: '2026-11-26T12:30:00+08:00' }],
+      source: { kind: 'time-context', form: 'snapshot' },
     },
   ];
 
@@ -341,18 +380,21 @@ test('planSessionSync tolerates Context OS surfaceOp: replace and runtime notice
     activeAcpSessionId: 'sess-live-1',
     lastToolsFingerprint: toolsFp,
     currentToolsFingerprint: toolsFp,
-    lastContextDigests: initialDigests,
+    lastHistoryPrefixDigest: turn1PrefixDigest,
     pendingToolCallIds: new Set(),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
 
   assert.equal(turn2Decision.kind, 'warm-incremental');
-  assert.equal(turn2Decision.tailMessages.length, 1);
-  assert.equal(turn2Decision.updatedContextBlocks.length, 1);
-  assert.match(turn2Decision.updatedContextBlocks[0], /step 2 IN PROGRESS/);
+  assert.equal(turn2Decision.tailMessages.length, 3);
+  const incParts = await buildIncrementalPromptParts({
+    tailMessages: turn2Decision.tailMessages,
+    priorSystemPrompt: turn2Decision.priorSystemPrompt,
+  });
+  const incText = incParts.map((p) => p.text).join('\n');
+  assert.ok(incText.indexOf('2026-11-26T12:30:00+08:00') < incText.indexOf('Now read README.md'));
 
-  // Cold replay preserves structured tool calls, tool results, and images
+  // Cold replay preserves structured tool calls, tool results, and current input
   const replayParts = await buildFullReplayPromptParts({
     messages: turn2Messages,
   });
@@ -391,21 +433,32 @@ test('formatHarnessGuidelines & buildFullReplayPromptParts strip third-party per
         source: { kind: 'user' },
       },
       {
+        id: 'skills-1',
         role: 'user',
-        content: [{ type: 'text', text: '<system-reminder>\nWorkspace skills catalog...\n</system-reminder>' }],
+        content: [{ type: 'text', text: 'Available skills catalog...' }],
+        source: { kind: 'skill-catalog', form: 'catalog' },
       },
       {
+        id: 'ctx-1',
         role: 'user',
-        content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier snapshots.' }],
+        content: [{ type: 'text', text: 'Working directory snapshot: /repo' }],
+        source: { kind: 'runtime-context', form: 'snapshot' },
       },
     ],
   });
 
   const fullText = parts.map((p) => (p.type === 'text' ? p.text : '')).join('\n');
-  const reminderPos = fullText.indexOf('<system-reminder>');
+  const reminderPos = fullText.indexOf('Available skills catalog...');
   const humanPos = fullText.indexOf('Reply with PONG_OK only.');
   assert.ok(reminderPos > 0);
-  assert.ok(humanPos > reminderPos, 'Human request must appear after trailing runtime reminders');
+  assert.ok(humanPos > reminderPos, 'Human request must appear after trailing ambient snapshots');
+
+  // Verify structured `isAmbientContextMessage` classification
+  assert.equal(isAmbientContextMessage({ role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }), false);
+  assert.equal(isAmbientContextMessage({ role: 'user', content: [{ type: 'text', text: 'job finished' }], source: { kind: 'tool-jobs', form: 'notice' } }), false);
+  assert.equal(isAmbientContextMessage({ role: 'user', content: [{ type: 'text', text: 'clock' }], source: { kind: 'time-context', form: 'snapshot' } }), true);
+  assert.equal(isAmbientContextMessage({ role: 'user', content: [{ type: 'text', text: 'bg' }], source: { kind: 'context-composition', slot: 'background' } }), true);
+  assert.equal(isAmbientContextMessage({ role: 'user', content: [{ type: 'text', text: 'event' }], source: { kind: 'context-composition' } }), false);
 });
 
 test('workspace guidelines match the registered bridge names, including PTC-only and empty catalogs', async () => {
@@ -535,9 +588,14 @@ test('classifyInBandAgyApiError detects standalone agy 429/403 retry banners wit
   assert.equal(prose, undefined);
 });
 
-test('computeHistoryPrefixDigest ignores system/developer/notices and detects conversational mutations', () => {
+test('computeHistoryPrefixDigest strips model persona headers while detecting any genuine prefix mutation', () => {
   const base = [
-    { role: 'system', content: [{ type: 'text', text: 'System v1' }] },
+    {
+      id: 'sys-0',
+      role: 'system',
+      content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent powered by the gemini-4-carbon model.\n\nSystem v1' }],
+      source: { kind: 'system-prompt' },
+    },
     { id: 'dev-1', role: 'developer', content: [{ type: 'text', text: 'Task: step 1' }], source: { kind: 'developer' } },
     { role: 'user', content: [{ type: 'text', text: 'Hello repo' }] },
     {
@@ -555,18 +613,35 @@ test('computeHistoryPrefixDigest ignores system/developer/notices and detects co
     },
   ];
 
-  // Mutating system/developer, inserting ephemeral notices, or promoting RequestUserInput to durable Message with id must keep digest stable
-  const benignVariant = [
-    { role: 'system', content: [{ type: 'text', text: 'System v2' }] },
-    { id: 'dev-1', role: 'developer', content: [{ type: 'text', text: 'Task: step 1 DONE' }], source: { kind: 'developer' } },
-    { id: 'dev-2', role: 'developer', content: [{ type: 'text', text: 'Extra context surface' }], source: { kind: 'developer' } },
+  // Switching models rewrites the third-party model-name persona header, or promoting RequestUserInput to durable Message with id: must keep digest 100% identical!
+  const modelSwitchedVariant = [
+    {
+      id: 'sys-0',
+      role: 'system',
+      content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent powered by the gemini-4-neon model.\n\nSystem v1' }],
+      source: { kind: 'system-prompt' },
+    },
+    base[1],
     { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'Hello repo' }], source: { kind: 'user' } },
-    { role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 2, step 1: 2026-11-20T12:00:00Z' }] },
-    { role: 'user', content: [{ type: 'text', text: '<system-reminder>\nSkills\n</system-reminder>' }] },
     base[3],
     base[4],
   ];
-  assert.equal(computeHistoryPrefixDigest(base), computeHistoryPrefixDigest(benignVariant));
+  assert.equal(computeHistoryPrefixDigest(base), computeHistoryPrefixDigest(modelSwitchedVariant));
+
+  // Genuine system instruction rewrite changes digest
+  const rewrittenSystem = [
+    { ...base[0], content: [{ type: 'text', text: 'System v2 (rewritten)' }] },
+    ...base.slice(1),
+  ];
+  assert.notEqual(computeHistoryPrefixDigest(base), computeHistoryPrefixDigest(rewrittenSystem));
+
+  // Genuine developer surface rewrite before anchor changes digest
+  const rewrittenDev = [
+    base[0],
+    { ...base[1], content: [{ type: 'text', text: 'Task: step 1 REWRITTEN' }] },
+    ...base.slice(2),
+  ];
+  assert.notEqual(computeHistoryPrefixDigest(base), computeHistoryPrefixDigest(rewrittenDev));
 
   // Tool result pruning (e.g. dsh-compaction-tool-result-pruner) changes digest
   const prunedTool = [...base.slice(0, 4), { ...base[4], content: [{ type: 'text', text: '[... tool result pruned ...]' }] }];
@@ -576,12 +651,12 @@ test('computeHistoryPrefixDigest ignores system/developer/notices and detects co
   const erroredTool = [...base.slice(0, 4), { ...base[4], isError: true }];
   assert.notEqual(computeHistoryPrefixDigest(base), computeHistoryPrefixDigest(erroredTool));
 
-  // Image offload (e.g. dsh-compaction-image-offload) changes digest even if text looks like a notice
+  // Image offload (e.g. dsh-compaction-image-offload) changes digest
   const withImage = [
     {
       role: 'user',
       content: [
-        { type: 'text', text: '<system-reminder>attached</system-reminder>' },
+        { type: 'text', text: 'attached' },
         {
           type: 'image',
           attachment: { attachmentId: 'img-1', mediaType: 'image/png', bytes: 64, width: 10, height: 10 },
@@ -593,7 +668,7 @@ test('computeHistoryPrefixDigest ignores system/developer/notices and detects co
     {
       role: 'user',
       content: [
-        { type: 'text', text: '<system-reminder>attached</system-reminder>' },
+        { type: 'text', text: 'attached' },
         {
           type: 'image',
           offloaded: true,
@@ -605,9 +680,15 @@ test('computeHistoryPrefixDigest ignores system/developer/notices and detects co
   assert.notEqual(computeHistoryPrefixDigest(withImage), computeHistoryPrefixDigest(offloadedImage));
 });
 
-test('planSessionSync detects compacted/mutated history prefix before anchorIdx (billion-context) while preserving Context OS', () => {
+test('planSessionSync detects compacted or replaced prefix before anchorIdx while keeping tail appends warm', async () => {
   const toolsFp = computeToolsFingerprint([{ name: 'read', description: 'Read', parameters: {} }]);
 
+  const sysBefore = {
+    id: 'sys-1',
+    role: 'system',
+    content: [{ type: 'text', text: 'You are a coding agent powered by the gemini-4-carbon model.\nBase rules v1' }],
+    source: { kind: 'system-prompt' },
+  };
   const devBefore = {
     id: 'dev-1',
     role: 'developer',
@@ -615,6 +696,7 @@ test('planSessionSync detects compacted/mutated history prefix before anchorIdx 
     source: { kind: 'developer' },
   };
   const u1 = { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'Read file A' }], source: { kind: 'user' } };
+  const notice1 = { id: 'n-1', role: 'user', content: [{ type: 'text', text: 'Working dir: /repo' }], source: { kind: 'runtime-context', form: 'snapshot' } };
   const a1 = {
     id: 'a-1',
     role: 'assistant',
@@ -630,9 +712,8 @@ test('planSessionSync detects compacted/mutated history prefix before anchorIdx 
   };
   const u2 = { id: 'u-2', role: 'user', content: [{ type: 'text', text: 'Summarize A' }], source: { kind: 'user' } };
 
-  const prefixBeforeAnchor = [devBefore, u1, a1, t1, u2];
+  const prefixBeforeAnchor = [sysBefore, devBefore, u1, notice1, a1, t1, u2];
   const savedPrefixDigest = computeHistoryPrefixDigest(prefixBeforeAnchor, prefixBeforeAnchor.length);
-  const savedContextDigests = computeContextDigests(prefixBeforeAnchor);
 
   const anchor = {
     id: 'a-anchor',
@@ -648,7 +729,6 @@ test('planSessionSync detects compacted/mutated history prefix before anchorIdx 
           rawModelId: 'gemini-4-carbon-medium',
           syncedMessageCount: prefixBeforeAnchor.length + 1,
           toolsFingerprint: toolsFp,
-          contextDigests: savedContextDigests,
           historyPrefixDigest: savedPrefixDigest,
         },
       },
@@ -656,116 +736,122 @@ test('planSessionSync detects compacted/mutated history prefix before anchorIdx 
   };
   const u3 = { id: 'u-3', role: 'user', content: [{ type: 'text', text: 'Next step?' }], source: { kind: 'user' } };
 
-  // 1. Range compaction (billion-context): replace u1/a1/t1 before anchorIdx with a summary node
+  // 1. Range compaction: replace u1/notice1/a1/t1 before anchorIdx with a summary node -> cold-full-replay
   const compactedSummary = {
     id: 'summary-1',
     role: 'user',
     content: [{ type: 'text', text: '[Compressed conversation section] User inspected a.ts (a = 1).' }],
-    source: { kind: 'user' },
+    source: { kind: 'compact-checkpoint' },
   };
   const compactedWarm = planSessionSync({
-    messages: [devBefore, compactedSummary, u2, anchor, u3],
+    messages: [sysBefore, devBefore, compactedSummary, u2, anchor, u3],
     activeAcpSessionId: 'sess-1',
     lastToolsFingerprint: toolsFp,
     currentToolsFingerprint: toolsFp,
-    lastContextDigests: savedContextDigests,
     lastHistoryPrefixDigest: savedPrefixDigest,
     pendingToolCallIds: new Set(),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
   assert.deepEqual(compactedWarm, {
     kind: 'cold-full-replay',
     reason: 'history-prefix-mutated-or-compacted',
   });
 
-  // Compaction is also detected on resume-incremental (worker restarted, digest read from anchorReplay)
+  // Compaction is also detected on resume-incremental
   const compactedResume = planSessionSync({
-    messages: [devBefore, compactedSummary, u2, anchor, u3],
+    messages: [sysBefore, devBefore, compactedSummary, u2, anchor, u3],
     activeAcpSessionId: undefined,
     currentToolsFingerprint: toolsFp,
     pendingToolCallIds: new Set(),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
   assert.deepEqual(compactedResume, {
     kind: 'cold-full-replay',
     reason: 'history-prefix-mutated-or-compacted',
   });
 
-  // 2. No regression for dsh-context-os: mutating only developer before anchorIdx stays warm-incremental
+  // 2. In-place replacement of developer or system before anchorIdx -> clean cold-full-replay (no silent drift!)
   const devMutated = {
     id: 'dev-1',
     role: 'developer',
-    content: [{ type: 'text', text: 'Context OS: plan v2 (updated)' }],
+    content: [{ type: 'text', text: 'Context OS: plan v2 (replaced in-place)' }],
     source: { kind: 'developer' },
   };
-  const contextOsDecision = planSessionSync({
-    messages: [devMutated, u1, a1, t1, u2, anchor, u3],
+  const replacedPrefixDecision = planSessionSync({
+    messages: [sysBefore, devMutated, u1, notice1, a1, t1, u2, anchor, u3],
     activeAcpSessionId: 'sess-1',
     lastToolsFingerprint: toolsFp,
     currentToolsFingerprint: toolsFp,
-    lastContextDigests: savedContextDigests,
     lastHistoryPrefixDigest: savedPrefixDigest,
     pendingToolCallIds: new Set(),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
-  assert.equal(contextOsDecision.kind, 'warm-incremental');
-  assert.deepEqual(contextOsDecision.updatedContextBlocks, ['Context OS: plan v2 (updated)']);
-  assert.equal(contextOsDecision.tailMessages.length, 1);
+  assert.deepEqual(replacedPrefixDecision, {
+    kind: 'cold-full-replay',
+    reason: 'history-prefix-mutated-or-compacted',
+  });
 
-  // 3. Normal turn + ephemeral runtime notices before and after anchorIdx stays warm-incremental
-  const noticeBefore = {
-    role: 'user',
-    content: [{ type: 'text', text: 'Current runtime context. Working directory: /repo' }],
+  // 3. In-history tail appends (system prompt update, runtime snapshot, user message) + model-persona switch stay warm-incremental!
+  const sysModelSwitched = {
+    ...sysBefore,
+    content: [{ type: 'text', text: 'You are a coding agent powered by the gemini-4-neon model.\nBase rules v1' }],
+  };
+  const sysTailPlanMode = {
+    id: 'sys-2',
+    role: 'system',
+    content: [{ type: 'text', text: 'You are a coding agent powered by the gemini-4-neon model.\nBase rules v1\nPlan mode active.' }],
+    source: { kind: 'system-prompt' },
   };
   const noticeAfter = {
+    id: 'n-2',
     role: 'user',
-    content: [{ type: 'text', text: 'Time sampled while preparing turn 3, step 1: 2026-11-20T12:05:00Z' }],
+    content: [{ type: 'text', text: 'Clock: 12:05' }],
+    source: { kind: 'time-context', form: 'snapshot' },
   };
   const normalDecision = planSessionSync({
-    messages: [devBefore, u1, noticeBefore, a1, t1, u2, anchor, noticeAfter, u3],
+    messages: [sysModelSwitched, devBefore, u1, notice1, a1, t1, u2, anchor, sysTailPlanMode, u3, noticeAfter],
     activeAcpSessionId: 'sess-1',
     lastToolsFingerprint: toolsFp,
     currentToolsFingerprint: toolsFp,
-    lastContextDigests: savedContextDigests,
     lastHistoryPrefixDigest: savedPrefixDigest,
     pendingToolCallIds: new Set(),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
   assert.equal(normalDecision.kind, 'warm-incremental');
-  assert.equal(normalDecision.tailMessages.length, 2);
+  assert.equal(normalDecision.tailMessages.length, 3);
+  const warmParts = await buildIncrementalPromptParts({
+    tailMessages: normalDecision.tailMessages,
+    priorSystemPrompt: normalDecision.priorSystemPrompt,
+  });
+  const warmJoined = warmParts.map((p) => p.text).join('\n');
+  assert.match(warmJoined, /<workspace_guidelines_update>[\s\S]*Plan mode active/);
+  assert.ok(warmJoined.indexOf('Clock: 12:05') < warmJoined.indexOf('Next step?'));
 
   // 4. Warm rewind/fork to an earlier anchor triggers cold replay when slot digest is ahead of anchor
   const laterSlotDigest = computeHistoryPrefixDigest([...prefixBeforeAnchor, anchor, u3]);
   const rewindDecision = planSessionSync({
-    messages: [devBefore, u1, a1, t1, u2, anchor, u3],
+    messages: [...prefixBeforeAnchor, anchor, u3],
     activeAcpSessionId: 'sess-1',
     lastToolsFingerprint: toolsFp,
     currentToolsFingerprint: toolsFp,
-    lastContextDigests: savedContextDigests,
     lastHistoryPrefixDigest: laterSlotDigest,
     pendingToolCallIds: new Set(),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
   assert.deepEqual(rewindDecision, {
     kind: 'cold-full-replay',
     reason: 'history-prefix-mutated-or-compacted',
   });
 
-  // 5. Stale slot digest must not poison resume-incremental when resuming a different/restarted session
+  // 5. Stale slot digest must not poison resume-incremental when resuming a restarted session
   const resumeWithStaleSlotState = planSessionSync({
-    messages: [devBefore, u1, a1, t1, u2, anchor, u3],
+    messages: [...prefixBeforeAnchor, anchor, u3],
     activeAcpSessionId: undefined,
     lastToolsFingerprint: 'stale-tools-fp',
     currentToolsFingerprint: toolsFp,
     lastHistoryPrefixDigest: 'stale-prefix-digest',
     pendingToolCallIds: new Set(),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
   assert.equal(resumeWithStaleSlotState.kind, 'resume-incremental');
   assert.equal(resumeWithStaleSlotState.resumeAcpSessionId, 'sess-1');
@@ -814,19 +900,19 @@ test('planSessionSync detects mid-turn compaction during resolve-pending-tools a
     source: { kind: 'tool' },
   };
 
-  // Mid-turn developer mutation alone still resolves pending tools warmly
-  const devUpdated = { ...dev, content: [{ type: 'text', text: 'Todo: step 2 in progress' }] };
-  const devOnlyMidTurn = planSessionSync({
-    messages: [devUpdated, u1, a1, u2, asstTool, toolRes],
+  // Intact prefix + trailing developer/user additions after toolTurnStartIdx resolve pending tools warmly
+  const devTail = { id: 'dev-2', role: 'developer', content: [{ type: 'text', text: 'Todo: step 2 in progress' }], source: { kind: 'developer' } };
+  const tailMidTurn = planSessionSync({
+    messages: [dev, u1, a1, u2, asstTool, toolRes, devTail],
     activeAcpSessionId: 'sess-mid-1',
     lastToolsFingerprint: toolsFp,
     currentToolsFingerprint: toolsFp,
     lastHistoryPrefixDigest: savedPrefixDigest,
     pendingToolCallIds: new Set(['tc-compress']),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
-  assert.equal(devOnlyMidTurn.kind, 'resolve-pending-tools');
+  assert.equal(tailMidTurn.kind, 'resolve-pending-tools');
+  assert.deepEqual(tailMidTurn.resolutions[0].trailingNotes, ['Todo: step 2 in progress']);
 
   // Mid-turn range compaction replaces [u1, a1] with summary node while tc-compress is pending -> cold-full-replay
   const summaryNode = {
@@ -843,7 +929,6 @@ test('planSessionSync detects mid-turn compaction during resolve-pending-tools a
     lastHistoryPrefixDigest: savedPrefixDigest,
     pendingToolCallIds: new Set(['tc-compress']),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
   assert.deepEqual(compactedMidTurn, {
     kind: 'cold-full-replay',
@@ -876,7 +961,6 @@ test('planSessionSync detects mid-turn compaction during resolve-pending-tools a
     currentToolsFingerprint: toolsFp,
     pendingToolCallIds: new Set(),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
   assert.equal(legacyWarm.kind, 'warm-incremental');
 
@@ -886,7 +970,6 @@ test('planSessionSync detects mid-turn compaction during resolve-pending-tools a
     currentToolsFingerprint: toolsFp,
     pendingToolCallIds: new Set(),
     allowResumeFromReplay: true,
-    forwardContextUpdates: true,
   });
   assert.equal(legacyResume.kind, 'resume-incremental');
   assert.equal(legacyResume.resumeAcpSessionId, 'sess-legacy');

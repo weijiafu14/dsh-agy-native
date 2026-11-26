@@ -10,6 +10,8 @@ export {
   type AgyReplayMetadata,
   type CatalogModelEntry,
   type CatalogSnapshot,
+  type McpToolCallResolution,
+  type McpToolResultContentItem,
   type PendingMcpToolCall,
   type ResolvedAgyAcpConfig,
 } from './types.js';
@@ -51,14 +53,16 @@ export {
   blocksToPlainText,
   buildFullReplayPromptParts,
   buildIncrementalPromptParts,
-  computeContextDigests,
+  buildMcpToolResultContent,
+  cleanSystemPromptText,
   computeHistoryPrefixDigest,
   extractReplayMetadata,
   extractSystemPrompt,
   formatHarnessGuidelines,
-  isEphemeralRuntimeNotice,
+  isAmbientContextMessage,
   planSessionSync,
   type ImageBytesLoader,
+  type PendingToolResolution,
   type SessionSyncDecision,
 } from './session-sync.js';
 

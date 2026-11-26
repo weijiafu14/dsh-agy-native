@@ -15,7 +15,7 @@ import {
 import {
   buildFullReplayPromptParts,
   buildIncrementalPromptParts,
-  computeContextDigests,
+  buildMcpToolResultContent,
   computeHistoryPrefixDigest,
   extractReplayMetadata,
   extractSystemPrompt,
@@ -320,7 +320,6 @@ export class SessionRuntime {
   #activeAcpSessionId?: string;
   #activeRawModelId?: string;
   #lastToolsFingerprint?: string;
-  #lastContextDigests?: Record<string, string>;
   #lastHistoryPrefixDigest?: string;
   #cachedPromptBaseline = 0;
   #inFlightPrompt?: Promise<AcpPromptResponse>;
@@ -414,18 +413,17 @@ export class SessionRuntime {
     try {
       const client = await this.#ensureClient(cfg);
 
-      const pendingIds = new Set(this.#endpoint?.getPendingCalls().map((c) => c.toolCallId));
+      const pendingIds = this.#endpoint?.getDispatchedCallIds() ?? new Set<string>();
       const syncPlan = planSessionSync({
         messages: options.messages,
+        explicitSystem: options.system,
         activeAcpSessionId: this.#activeAcpSessionId,
         lastToolsFingerprint: this.#lastToolsFingerprint,
         currentToolsFingerprint: toolsFp,
-        lastContextDigests: this.#lastContextDigests,
         lastHistoryPrefixDigest: this.#lastHistoryPrefixDigest,
         pendingToolCallIds: pendingIds,
         allowResumeFromReplay: cfg.resumeSessions && !!options.sessionId && options.purpose === undefined,
         dshSessionId: options.sessionId,
-        forwardContextUpdates: cfg.forwardContextUpdates,
       });
 
       if (syncPlan.kind !== 'resolve-pending-tools') {
@@ -488,8 +486,14 @@ export class SessionRuntime {
           client.setStreamCallbacks(this.#activeAcpSessionId!, callbacks);
           this.#attachPromptCompletion(this.#inFlightPrompt, queue);
           for (const res of syncPlan.resolutions) {
+            const content = await buildMcpToolResultContent({
+              content: res.content,
+              trailingNotes: res.trailingNotes,
+              loadImage: this.#loadImage,
+              signal: options.signal,
+            });
             endpoint.resolveToolCall(res.toolCallId, {
-              text: res.text,
+              content,
               isError: res.isError,
             });
           }
@@ -507,7 +511,7 @@ export class SessionRuntime {
             }
             promptParts = await buildIncrementalPromptParts({
               tailMessages: syncPlan.tailMessages,
-              updatedContextBlocks: syncPlan.updatedContextBlocks,
+              priorSystemPrompt: syncPlan.priorSystemPrompt,
               loadImage: this.#loadImage,
               signal: options.signal,
             });
@@ -563,6 +567,7 @@ export class SessionRuntime {
           const historyPrefixDigest = computeHistoryPrefixDigest(
             options.messages,
             options.messages.length,
+            options.system,
           );
           const meta: AgyReplayMetadata = {
             version: 1,
@@ -571,11 +576,9 @@ export class SessionRuntime {
             rawModelId: targetRawModelId,
             syncedMessageCount: options.messages.length + 1,
             toolsFingerprint: toolsFp,
-            contextDigests: computeContextDigests(options.messages),
             historyPrefixDigest,
           };
           this.#lastToolsFingerprint = toolsFp;
-          this.#lastContextDigests = meta.contextDigests;
           this.#lastHistoryPrefixDigest = historyPrefixDigest;
           return { response: meta };
         };
@@ -838,7 +841,6 @@ export class SessionRuntime {
     this.#activeAcpSessionId = undefined;
     this.#activeRawModelId = undefined;
     this.#lastToolsFingerprint = undefined;
-    this.#lastContextDigests = undefined;
     this.#lastHistoryPrefixDigest = undefined;
     this.#cachedPromptBaseline = 0;
   }

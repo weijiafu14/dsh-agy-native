@@ -13,14 +13,18 @@ import {
 } from './types.js';
 
 const EFFORT_LABELS: Record<AgyEffortSlug, { name: string; description: string }> = {
+  minimal: { name: 'Minimal', description: 'Ultra-low latency with minimal thinking' },
   low: { name: 'Low', description: 'Fastest responses with minimal thinking budget' },
   medium: { name: 'Medium', description: 'Balanced reasoning depth and latency' },
   high: { name: 'High', description: 'Deep multi-step reasoning for complex engineering tasks' },
+  extra: { name: 'Extra', description: 'Extended reasoning budget above High' },
   xhigh: { name: 'XHigh', description: 'Maximum extended thinking budget' },
+  max: { name: 'Max', description: 'Unbounded maximum reasoning depth' },
 };
 
-const EFFORT_SUFFIX_RE = /^(.+)-(low|medium|high|xhigh)$/i;
-const PAREN_EFFORT_NAME_RE = /\s*\((low|medium|high|xhigh)\)\s*$/i;
+const EFFORT_PATTERN = EFFORT_ORDER.join('|');
+const EFFORT_SUFFIX_RE = new RegExp(`^(.+)-(${EFFORT_PATTERN})$`, 'i');
+const PAREN_EFFORT_NAME_RE = new RegExp(`\\s*\\((${EFFORT_PATTERN})\\)\\s*$`, 'i');
 
 export function defaultContextWindowForModel(modelId: string): number {
   const lower = modelId.toLowerCase();
@@ -260,6 +264,7 @@ export class AgyModelCatalog {
         name: family.name,
         ...(family.description ? { description: family.description } : {}),
         inputModalities: ['text', 'image'] as const,
+        systemPromptUpdate: 'in-history' as const,
         context: { contextWindow: family.contextWindow },
         ...(efforts.length > 0
           ? {
@@ -284,6 +289,7 @@ export class AgyModelCatalog {
       name: raw?.name ?? model,
       ...(raw?.description ? { description: raw.description } : {}),
       inputModalities: ['text', 'image'] as const,
+      systemPromptUpdate: 'in-history' as const,
       context: { contextWindow },
     };
   }

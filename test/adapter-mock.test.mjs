@@ -294,11 +294,11 @@ test('AgyAcpAdapter resets ACP session on prefix compaction (between turns and m
       source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: t1Finish.replayState },
     };
 
-    // Turn 2: Context OS mutates developer surface only -> must stay on warm sess1 (Turn=2) and forward update
-    const devV2 = {
-      id: 'dev-ctx',
+    // Turn 2: Appending new developer/context updates at the tail stays on warm sess1 (Turn=2)
+    const devTailUpdate = {
+      id: 'dev-ctx-2',
       role: 'developer',
-      content: [{ type: 'text', text: 'CTX_OS_STATE_V2_UPDATED' }],
+      content: [{ type: 'text', text: 'CTX_OS_STATE_V2_APPENDED' }],
       source: { kind: 'developer' },
     };
     const u2 = {
@@ -312,7 +312,7 @@ test('AgyAcpAdapter resets ACP session on prefix compaction (between turns and m
         provider: 'agy-acp',
         model: 'gemini-4-carbon',
         sessionId: 'dsh-compact-1',
-        messages: [devV2, u1, a1, u2],
+        messages: [devV1, u1, a1, devTailUpdate, u2],
         tools,
       }),
     );
@@ -320,7 +320,7 @@ test('AgyAcpAdapter resets ACP session on prefix compaction (between turns and m
     const t2Finish = t2Chunks.find((c) => c.type === 'finish');
     assert.equal(t2Finish.replayState.response.acpSessionId, sess1);
     assert.match(t2Text, new RegExp(`Session=${sess1} Turn=2`));
-    assert.match(t2Text, /CTX_OS_STATE_V2_UPDATED/);
+    assert.match(t2Text, /CTX_OS_STATE_V2_APPENDED/);
     assert.doesNotMatch(t2Text, /<conversation_history>/);
 
     const a2 = {
@@ -330,7 +330,13 @@ test('AgyAcpAdapter resets ACP session on prefix compaction (between turns and m
       source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: t2Finish.replayState },
     };
 
-    // Turn 3: billion-context replaces [u1, a1] with a summary node while keeping a2 intact -> must reset to fresh ACP session (Turn=1)
+    // Turn 3: Compaction or in-place replacement before a2 resets to a fresh ACP session (Turn=1)
+    const devV2 = {
+      id: 'dev-ctx',
+      role: 'developer',
+      content: [{ type: 'text', text: 'CTX_OS_STATE_V2_REPLACED' }],
+      source: { kind: 'developer' },
+    };
     const summaryMsg = {
       id: 'sum-1',
       role: 'user',
@@ -348,7 +354,7 @@ test('AgyAcpAdapter resets ACP session on prefix compaction (between turns and m
         provider: 'agy-acp',
         model: 'gemini-4-carbon',
         sessionId: 'dsh-compact-1',
-        messages: [devV2, summaryMsg, u2, a2, u3],
+        messages: [devV2, summaryMsg, devTailUpdate, u2, a2, u3],
         tools,
       }),
     );
@@ -380,7 +386,7 @@ test('AgyAcpAdapter resets ACP session on prefix compaction (between turns and m
         provider: 'agy-acp',
         model: 'gemini-4-carbon',
         sessionId: 'dsh-compact-1',
-        messages: [devV2, summaryMsg, u2, a2, u3, a3, u4],
+        messages: [devV2, summaryMsg, devTailUpdate, u2, a2, u3, a3, u4],
         tools,
       }),
     );
@@ -679,4 +685,177 @@ test('process loss restores saved sessions, cold-replays unavailable sessions, a
   assert.notEqual(id(fork), id(saved));
   assert.match(resumed.content.at(-1).text, /Turn=2/);
   assert.ok(resumed.content.every(b => !b.text.includes('historical load event')));
+});
+
+test('straggler parallel tools across batchWindowMs, multimodal tool images, mid-turn job notices, and hot model switch preserve warm session', { timeout: 10000 }, async () => {
+  const tmpCache = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-straggler-test-'));
+  const cfg = resolveAgyAcpConfig({
+    agyPath: FAKE_AGY_PATH,
+    batchWindowMs: 20,
+    cacheDir: tmpCache,
+  });
+  const adapter = new AgyAcpAdapter({
+    getConfig: () => cfg,
+    loadImage: async (ref) => ({
+      base64: Buffer.from(`TOOL_IMG:${ref.attachmentId}`).toString('base64'),
+      mimeType: ref.mediaType ?? 'image/png',
+    }),
+  });
+
+  try {
+    const resolved = await adapter.resolveModel('agy-acp', 'gemini-4-carbon');
+    assert.equal(resolved.systemPromptUpdate, 'in-history');
+
+    const tools = [
+      { name: 'get_left', description: 'Left', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+      { name: 'get_right', description: 'Right', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+    ];
+    const sysCarbon = {
+      id: 'sys-0',
+      role: 'system',
+      content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent powered by the gemini-4-carbon model.\n\nKeep answers concise.' }],
+      source: { kind: 'system-prompt' },
+    };
+    const u1 = {
+      id: 'u-strag-1',
+      role: 'user',
+      content: [{ type: 'text', text: 'Run CALL_STRAGGLER_TOOLS now' }],
+      source: { kind: 'user' },
+    };
+
+    // Step 1: Call 1 arrives at 0ms -> flushed after 20ms; Call 2 arrives at 55ms while DSH executes Call 1!
+    const s1Chunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-straggler-1',
+        messages: [sysCarbon, u1],
+        tools,
+      }),
+    );
+    const s1Finish = s1Chunks.find((c) => c.type === 'finish');
+    assert.equal(s1Finish.reason.kind, 'tool-calls');
+    const warmSessionId = s1Finish.replayState.response.acpSessionId;
+    const s1Calls = s1Chunks.filter((c) => c.type === 'block-end' && c.block.type === 'tool-call').map((c) => c.block);
+    assert.equal(s1Calls.length, 1);
+    assert.equal(s1Calls[0].name, 'get_left');
+
+    // Wait 70ms so Call 2 (sent at 55ms) has arrived at MCP bridge AND its timer elapsed while DSH was busy
+    await new Promise((r) => setTimeout(r, 70));
+
+    const a1 = {
+      id: 'a-strag-1',
+      role: 'assistant',
+      content: s1Calls,
+      source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: s1Finish.replayState },
+    };
+    const tr1 = {
+      id: 'tr-strag-1',
+      role: 'tool',
+      toolCallId: s1Calls[0].id,
+      content: [{ type: 'text', text: 'FIRST_OK' }],
+      source: { kind: 'tool' },
+    };
+
+    // Step 2: Resolve Call 1 warmly (must NOT cold-replay!) and receive buffered Call 2
+    const s2Chunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-straggler-1',
+        messages: [sysCarbon, u1, a1, tr1],
+        tools,
+      }),
+    );
+    const s2Finish = s2Chunks.find((c) => c.type === 'finish');
+    assert.equal(s2Finish.reason.kind, 'tool-calls');
+    assert.equal(s2Finish.replayState.response.acpSessionId, warmSessionId, 'Straggler batch must preserve warm session');
+    const s2Calls = s2Chunks.filter((c) => c.type === 'block-end' && c.block.type === 'tool-call').map((c) => c.block);
+    assert.equal(s2Calls.length, 1);
+    assert.equal(s2Calls[0].name, 'get_right');
+
+    // Step 3: Resolve Call 2 with a multimodal tool image + a mid-turn `tool-jobs` completion notice!
+    const a2 = {
+      id: 'a-strag-2',
+      role: 'assistant',
+      content: s2Calls,
+      source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: s2Finish.replayState },
+    };
+    const tr2 = {
+      id: 'tr-strag-2',
+      role: 'tool',
+      toolCallId: s2Calls[0].id,
+      content: [
+        { type: 'text', text: 'SCREENSHOT_CAPTURED' },
+        {
+          type: 'image',
+          attachment: { attachmentId: 'shot-1', mediaType: 'image/png', bytes: 64, width: 20, height: 20 },
+        },
+      ],
+      source: { kind: 'tool' },
+    };
+    const midTurnJobNotice = {
+      id: 'job-notice-1',
+      role: 'user',
+      content: [{ type: 'text', text: 'background job j1 (bash: build) finished [status: exited(0)]. Output: BUILD_GREEN' }],
+      source: { kind: 'tool-jobs', form: 'notice' },
+    };
+
+    const s3Chunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-straggler-1',
+        messages: [sysCarbon, u1, a1, tr1, a2, tr2, midTurnJobNotice],
+        tools,
+      }),
+    );
+    const s3Text = s3Chunks.find((c) => c.type === 'block-end' && c.block.type === 'text').block.text;
+    const s3Finish = s3Chunks.find((c) => c.type === 'finish');
+    assert.equal(s3Finish.replayState.response.acpSessionId, warmSessionId);
+    assert.match(s3Text, new RegExp(`^Straggler=${warmSessionId}:T1:FIRST_OK\\+SCREENSHOT_CAPTURED\\|BLOCK\\|\\[mcp-img:image/png:\\d+\\]\\|BLOCK\\|<dsh_context_note>`));
+    assert.match(s3Text, /BUILD_GREEN/);
+
+    // Turn 2: User switches model to Hydrogen -> DSH either appends or replaces persona header with new model name; warm session stays intact (Turn=2)!
+    const a3 = {
+      id: 'a-strag-3',
+      role: 'assistant',
+      content: [{ type: 'text', text: s3Text }],
+      source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: s3Finish.replayState },
+    };
+    const sysHydrogenReplaced = {
+      ...sysCarbon,
+      content: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.\n\nYou are a coding agent powered by the gemini-4-hydrogen model.\n\nKeep answers concise.' }],
+    };
+    const idleJobWakeup = {
+      id: 'job-wakeup-2',
+      role: 'user',
+      content: [{ type: 'text', text: 'ECHO_PROMPT background job j2 finished [status: exited(0)].' }],
+      source: { kind: 'tool-jobs', form: 'notice' },
+    };
+    const timeSnapshot = {
+      id: 'time-2',
+      role: 'user',
+      content: [{ type: 'text', text: 'Clock reading: 2026-11-26T12:40:00+08:00' }],
+      source: { kind: 'time-context', form: 'snapshot' },
+    };
+
+    const t2Chunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-hydrogen',
+        reasoningEffort: 'xhigh',
+        sessionId: 'dsh-straggler-1',
+        messages: [sysHydrogenReplaced, u1, a1, tr1, a2, tr2, midTurnJobNotice, a3, idleJobWakeup, timeSnapshot],
+        tools,
+      }),
+    );
+    const t2Text = t2Chunks.find((c) => c.type === 'block-end' && c.block.type === 'text').block.text;
+    assert.match(t2Text, new RegExp(`Session=${warmSessionId} Turn=2 Model=gemini-4-hydrogen-xhigh`));
+    // Clock snapshot ordered before job wakeup via `source.kind` even with non-standard English wording!
+    assert.ok(t2Text.indexOf('Clock reading:') < t2Text.indexOf('background job j2 finished'));
+  } finally {
+    await adapter.dispose();
+    fs.rmSync(tmpCache, { recursive: true, force: true });
+  }
 });
