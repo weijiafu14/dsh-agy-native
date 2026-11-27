@@ -1161,3 +1161,108 @@ test('AgyAcpAdapter converts 300KB non-Gemini conversation into native SQLite tr
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
+
+test('AgyAcpAdapter reuses the exact same warm ACP session for mid-turn compaction while MCP tool calls are suspended', async () => {
+  const tmpCache = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-midturn-compact-'));
+  const cfg = resolveAgyAcpConfig({
+    agyPath: FAKE_AGY_PATH,
+    cacheDir: tmpCache,
+    batchWindowMs: 25,
+  });
+  const adapter = new AgyAcpAdapter({ getConfig: () => cfg });
+
+  const tools = [
+    { name: 'get_left', description: 'Get left value', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+    { name: 'get_right', description: 'Get right value', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+  ];
+
+  try {
+    // Turn 1: establish a warm ACP session
+    const u1 = { id: 'u-mt-1', role: 'user', content: [{ type: 'text', text: 'ECHO_PROMPT Turn 1 baseline' }], source: { kind: 'user' } };
+    const t1Chunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-midturn-compact-1',
+        messages: [u1],
+        tools,
+      }),
+    );
+    const t1Finish = t1Chunks.find((c) => c.type === 'finish');
+    assert.equal(t1Finish.reason.kind, 'stop');
+    const warmSessionId = t1Finish.replayState.response.acpSessionId;
+    const a1 = {
+      id: 'a-mt-1',
+      role: 'assistant',
+      content: t1Chunks.filter((c) => c.type === 'block-end').map((c) => c.block),
+      source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: t1Finish.replayState },
+    };
+
+    // Turn 2 Step 1: trigger parallel tool calls so ACP session suspends with pendingToolCallIds > 0
+    const u2 = { id: 'u-mt-2', role: 'user', content: [{ type: 'text', text: 'CALL_PARALLEL_TOOLS inspect files' }], source: { kind: 'user' } };
+    const t2Step1Chunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-midturn-compact-1',
+        messages: [u1, a1, u2],
+        tools,
+      }),
+    );
+    const t2Step1Finish = t2Step1Chunks.find((c) => c.type === 'finish');
+    assert.equal(t2Step1Finish.reason.kind, 'tool-calls');
+    assert.equal(t2Step1Finish.replayState.response.acpSessionId, warmSessionId);
+
+    // Mid-turn compaction triggers BEFORE DSH resolves the pending tool calls!
+    // Adapter must cancel the suspended turn in-place and run compaction on the EXACT SAME warmSessionId.
+    const compactChunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-midturn-compact-1',
+        purpose: 'compaction',
+        messages: [
+          u1,
+          a1,
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'ECHO_PROMPT Summarize earlier span into checkpoint.' }],
+          },
+        ],
+        tools,
+      }),
+    );
+    const compactFinish = compactChunks.find((c) => c.type === 'finish');
+    assert.equal(compactFinish.reason.kind, 'stop');
+    assert.equal(
+      compactFinish.replayState.response.acpSessionId,
+      warmSessionId,
+      'Mid-turn compaction must reuse the exact same warm ACP session ID to preserve KV cache',
+    );
+    const compactText = compactChunks.find((c) => c.type === 'block-end' && c.block.type === 'text').block.text;
+    assert.match(compactText, new RegExp(`Session=${warmSessionId} Turn=3`));
+    assert.doesNotMatch(compactText, /<conversation_history>/);
+    assert.match(compactText, /\[Compaction boundary: Condense ONLY the earlier conversation span/);
+    assert.match(compactText, /interrupted tool calls/);
+
+    // Post-compaction main turn must open a fresh clean ACP session cleanly (without stale cancelled state)
+    const postChunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-midturn-compact-1',
+        messages: [
+          { id: 'ckpt-mt', role: 'user', content: [{ type: 'text', text: '<compacted-summary>Turn 1</compacted-summary>' }], source: { kind: 'user' } },
+          { id: 'u-mt-3', role: 'user', content: [{ type: 'text', text: 'ECHO_PROMPT Resume after mid-turn compaction' }], source: { kind: 'user' } },
+        ],
+        tools,
+      }),
+    );
+    const postFinish = postChunks.find((c) => c.type === 'finish');
+    assert.equal(postFinish.reason.kind, 'stop');
+    assert.notEqual(postFinish.replayState.response.acpSessionId, warmSessionId);
+  } finally {
+    await adapter.dispose();
+    fs.rmSync(tmpCache, { recursive: true, force: true });
+  }
+});

@@ -552,10 +552,11 @@ export class SessionRuntime {
         purpose: options.purpose,
       });
 
+      const priorWarmSessionId = this.#activeAcpSessionId;
       if (syncPlan.kind !== 'resolve-pending-tools') {
         const replace = syncPlan.kind !== 'warm-incremental';
         await this.#abortInFlightTurn(replace);
-        if (replace) {
+        if (replace || !this.#activeAcpSessionId) {
           this.#endpoint?.dispose();
           this.#endpoint = undefined;
         }
@@ -563,10 +564,16 @@ export class SessionRuntime {
       let endpoint = await this.#ensureEndpoint(cfg);
       endpoint.setTools(options.tools);
       let resumed = false;
-      if (syncPlan.kind === 'resume-incremental' && client.capabilities?.loadSession) {
+      const reloadSessionId =
+        syncPlan.kind === 'resume-incremental'
+          ? syncPlan.resumeAcpSessionId
+          : syncPlan.kind === 'warm-incremental' && !this.#activeAcpSessionId
+            ? priorWarmSessionId
+            : undefined;
+      if (reloadSessionId && client.capabilities?.loadSession) {
         try {
-          await client.loadSession({ sessionId: syncPlan.resumeAcpSessionId, endpoint, cwd: cfg.workingDirectory });
-          this.#activeAcpSessionId = syncPlan.resumeAcpSessionId;
+          await client.loadSession({ sessionId: reloadSessionId, endpoint, cwd: cfg.workingDirectory });
+          this.#activeAcpSessionId = reloadSessionId;
           resumed = true;
         } catch {
           // Even a timed-out load may have received the URL. Revoke it before cold replay.
@@ -599,10 +606,10 @@ export class SessionRuntime {
           options.signal?.reason instanceof Error
             ? options.signal.reason
             : new Error(String(options.signal?.reason ?? 'Request aborted'));
-        endpoint.cancelAllPending(reason.message);
         if (this.#activeAcpSessionId) {
           client.cancelPrompt(this.#activeAcpSessionId);
         }
+        endpoint.cancelAllPending(reason.message);
         queue.push({ kind: 'aborted', reason });
       };
       options.signal?.addEventListener('abort', onAbort, { once: true });
@@ -662,12 +669,15 @@ export class SessionRuntime {
           };
 
           let promptParts: AcpPromptPart[] | undefined;
-          if (syncPlan.kind === 'warm-incremental' || (syncPlan.kind === 'resume-incremental' && resumed)) {
+          if (
+            (syncPlan.kind === 'warm-incremental' && this.#activeAcpSessionId) ||
+            (syncPlan.kind === 'resume-incremental' && resumed && this.#activeAcpSessionId)
+          ) {
             if (resumed || this.#activeRawModelId !== targetRawModelId) {
-              await client.setModel(this.#activeAcpSessionId!, targetRawModelId);
+              await client.setModel(this.#activeAcpSessionId, targetRawModelId);
               this.#activeRawModelId = targetRawModelId;
             }
-            restoreBaselineFromAnchor(this.#activeAcpSessionId!);
+            restoreBaselineFromAnchor(this.#activeAcpSessionId);
             promptParts = await buildIncrementalPromptParts({
               tailMessages: syncPlan.tailMessages,
               priorSystemPrompt: syncPlan.priorSystemPrompt,
@@ -681,7 +691,6 @@ export class SessionRuntime {
           } else {
             targetRawModelId = await this.#openFreshSession(client, endpoint, options, cfg);
             const split = splitMessagesForTrajectorySync(options.messages);
-            let hydratedTrajectory = false;
 
             if (split.hasPriorTurns && client.capabilities?.loadSession && this.#activeAcpSessionId) {
               const freshSessionId = this.#activeAcpSessionId;
@@ -729,7 +738,6 @@ export class SessionRuntime {
                       );
                       if (routing) promptParts.unshift({ type: 'text', text: routing });
                     }
-                    hydratedTrajectory = true;
                   } catch {
                     targetRawModelId = await this.#openFreshSession(
                       client,
@@ -1095,13 +1103,16 @@ export class SessionRuntime {
   }
 
   async #abortInFlightTurn(closeExistingSession: boolean): Promise<void> {
-    this.#endpoint?.cancelAllPending('Turn superseded');
     let settledInTime = true;
-    if (this.#inFlightPrompt && this.#activeAcpSessionId && this.#client?.alive) {
+    const inFlight = this.#inFlightPrompt;
+    if (inFlight && this.#activeAcpSessionId && this.#client?.alive) {
       settledInTime = false;
+      // Signal session/cancel BEFORE rejecting suspended MCP calls so `agy` exits with
+      // `stopReason: 'cancelled'` instead of triggering an extra LLM retry round-trip.
       this.#client.cancelPrompt(this.#activeAcpSessionId);
+      this.#endpoint?.cancelAllPending('Turn superseded');
       await Promise.race([
-        this.#inFlightPrompt.then(
+        inFlight.then(
           () => {
             settledInTime = true;
           },
@@ -1110,10 +1121,12 @@ export class SessionRuntime {
           },
         ),
         new Promise<void>((r) => {
-          const timer = setTimeout(r, 2_500);
+          const timer = setTimeout(r, 5_000);
           timer.unref?.();
         }),
       ]);
+    } else {
+      this.#endpoint?.cancelAllPending('Turn superseded');
     }
     this.#inFlightTurnUsage = undefined;
     this.#inFlightPrompt = undefined;

@@ -1272,6 +1272,71 @@ test('planSessionSync reuses warm and resumable ACP sessions for purpose=compact
   assert.match(warmDecision.tailMessages[0].content[0].text, /\[Compaction boundary:/);
   assert.match(warmDecision.tailMessages[0].content[0].text, /Completed first task anchor/);
 
+  // Mid-turn compaction while pendingToolCallIds is non-empty (normal retained-tail case):
+  // must STILL stay warm-incremental on acp-s1 (never cold-replay with a fresh session ID)!
+  const midTurnWarmDecision = planSessionSync({
+    messages: [u1, a1, directive],
+    activeAcpSessionId: 'acp-s1',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    lastHistoryPrefixDigest: fullSessionDigest,
+    pendingToolCallIds: new Set(['call-mid-turn-1']),
+    allowResumeFromReplay: true,
+    dshSessionId: 'dsh-s1',
+    purpose: 'compaction',
+  });
+  assert.equal(midTurnWarmDecision.kind, 'warm-incremental');
+  assert.equal(midTurnWarmDecision.tailMessages.length, 1);
+  assert.match(midTurnWarmDecision.tailMessages[0].content[0].text, /\[Compaction boundary:/);
+  assert.match(midTurnWarmDecision.tailMessages[0].content[0].text, /interrupted tool calls/);
+
+  // Mid-turn compaction when the compaction span itself includes the pending tool's result:
+  // must stay warm-incremental and forward the unsynced tool result right before the directive!
+  const aToolDigest = computeHistoryPrefixDigest([u1, a1, u2]);
+  const aTool = {
+    id: 'a-tool',
+    role: 'assistant',
+    content: [{ type: 'tool-call', id: 'call-mid-turn-2', name: 'read', arguments: '{"path":"a.ts"}' }],
+    source: {
+      provider: 'agy-acp',
+      model: 'gemini-4-carbon',
+      replayState: {
+        response: {
+          version: 1,
+          dshSessionId: 'dsh-s1',
+          acpSessionId: 'acp-s1',
+          rawModelId: 'gemini-4-carbon-medium',
+          syncedMessageCount: 4,
+          toolsFingerprint: toolsFp,
+          historyPrefixDigest: aToolDigest,
+        },
+      },
+    },
+  };
+  const tTool = {
+    id: 't-tool',
+    role: 'tool',
+    toolCallId: 'call-mid-turn-2',
+    content: [{ type: 'text', text: 'file contents from call-mid-turn-2' }],
+    source: { kind: 'tool' },
+  };
+  const midTurnSpanningTool = planSessionSync({
+    messages: [u1, a1, u2, aTool, tTool, directive],
+    activeAcpSessionId: 'acp-s1',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    lastHistoryPrefixDigest: aToolDigest,
+    pendingToolCallIds: new Set(['call-mid-turn-2']),
+    allowResumeFromReplay: true,
+    dshSessionId: 'dsh-s1',
+    purpose: 'compaction',
+  });
+  assert.equal(midTurnSpanningTool.kind, 'warm-incremental');
+  assert.equal(midTurnSpanningTool.tailMessages.length, 2);
+  assert.equal(midTurnSpanningTool.tailMessages[0].role, 'tool');
+  assert.equal(midTurnSpanningTool.tailMessages[0].toolCallId, 'call-mid-turn-2');
+  assert.doesNotMatch(midTurnSpanningTool.tailMessages[1].content[0].text, /\[Compaction boundary:/);
+
   // Restarted worker (`activeAcpSessionId === undefined`): must resume `acp-s1` via session/load!
   const resumeDecision = planSessionSync({
     messages: [u1, a1, directive],

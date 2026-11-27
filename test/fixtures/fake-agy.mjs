@@ -213,6 +213,7 @@ rl.on('line', async (line) => {
   if (msg.method === 'session/prompt') {
     const { sessionId, prompt } = msg.params;
     const sess = sessions.get(sessionId);
+    sess.cancelled = false;
     sess.prompts += 1;
 
     const textJoined = prompt
