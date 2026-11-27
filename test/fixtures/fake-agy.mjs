@@ -1,7 +1,59 @@
 #!/usr/bin/env node
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import { createInterface } from 'node:readline';
+import { DatabaseSync } from 'node:sqlite';
+
+function initFakeTrajectoryDb(sessionId) {
+  const stateDir = process.env.AGY_STATE_DIR?.trim();
+  if (!stateDir) return;
+  const convDir = path.join(stateDir, 'conversations');
+  fs.mkdirSync(convDir, { recursive: true });
+  const dbPath = path.join(convDir, `${sessionId}.db`);
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS trajectory_meta (
+        trajectory_id text PRIMARY KEY,
+        cascade_id text,
+        trajectory_type integer,
+        source integer
+      );
+      CREATE TABLE IF NOT EXISTS steps (
+        idx integer PRIMARY KEY,
+        step_type integer NOT NULL DEFAULT 0,
+        status integer NOT NULL DEFAULT 0,
+        has_subtrajectory numeric NOT NULL DEFAULT false,
+        metadata blob,
+        error_details blob,
+        permissions blob,
+        task_details blob,
+        render_info blob,
+        step_payload blob,
+        step_format integer NOT NULL DEFAULT 0
+      );
+    `);
+    db.prepare(
+      'INSERT OR REPLACE INTO trajectory_meta (trajectory_id, cascade_id, trajectory_type, source) VALUES (?, ?, 4, 17)',
+    ).run(randomUUID(), sessionId);
+  } finally {
+    db.close();
+  }
+}
+
+function readFakeTrajectoryDbSteps(sessionId) {
+  const stateDir = process.env.AGY_STATE_DIR?.trim();
+  if (!stateDir) return undefined;
+  const dbPath = path.join(stateDir, 'conversations', `${sessionId}.db`);
+  if (!fs.existsSync(dbPath)) return undefined;
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db.prepare('SELECT idx, step_type, step_payload FROM steps ORDER BY idx ASC').all();
+  } finally {
+    db.close();
+  }
+}
 
 if (process.argv.includes('--help')) {
   console.log('  --process-per-session  Isolate session workers');
@@ -87,10 +139,12 @@ rl.on('line', async (line) => {
       return;
     }
     const sessionId = `fake-sess-${process.pid}-${++sessionCounter}`;
+    initFakeTrajectoryDb(sessionId);
     sessions.set(sessionId, {
       mcpServer: msg.params?.mcpServers?.[0],
       modelId: 'gemini-4-carbon-medium',
       prompts: 0,
+      dbSteps: [],
     });
     send({
       id: msg.id,
@@ -123,10 +177,12 @@ rl.on('line', async (line) => {
       return;
     }
     const existing = sessions.get(sessionId);
+    const loadedDbSteps = readFakeTrajectoryDbSteps(sessionId) ?? existing?.dbSteps ?? [];
     sessions.set(sessionId, {
       mcpServer: msg.params?.mcpServers?.[0] ?? existing?.mcpServer,
       modelId: existing?.modelId ?? 'gemini-4-carbon-medium',
       prompts: existing?.prompts ?? 1,
+      dbSteps: loadedDbSteps,
     });
     send({ method: 'session/update', params: { sessionId, update: {
       sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'historical load event' },
@@ -184,6 +240,31 @@ rl.on('line', async (line) => {
           },
         },
       });
+    }
+
+    if (textJoined.includes('INSPECT_DB_TRAJECTORY')) {
+      const types = (sess.dbSteps ?? []).map((r) => r.step_type).join(',');
+      const mcpToolsList = sess.mcpServer
+        ? (await callMcp(sess.mcpServer, 'tools/list', {})).result.tools.map((t) => t.name).join(',')
+        : '';
+      const out = JSON.stringify({
+        sessionId,
+        dbStepTypes: types,
+        dbStepCount: (sess.dbSteps ?? []).length,
+        hasHistoryTagInPrompt: textJoined.includes('<conversation_history>'),
+        promptBytes: Buffer.byteLength(textJoined, 'utf8'),
+        mcpTools: mcpToolsList,
+        promptText: textJoined,
+      });
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: out } },
+        },
+      });
+      send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      return;
     }
 
     if (textJoined.includes('INSPECT_CURRENT_INPUT')) {

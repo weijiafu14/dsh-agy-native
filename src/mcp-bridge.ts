@@ -50,9 +50,10 @@ export function encodeMcpToolName(name: string, usedNames: Set<string>): string 
 
 /** Compute a deterministic fingerprint over active tool schemas so we detect schema changes. */
 export function computeToolsFingerprint(tools: readonly ToolSchema[] | undefined): string {
-  if (!tools || tools.length === 0) return 'none';
+  const active = tools?.filter((t) => !t.deferLoading);
+  if (!active || active.length === 0) return 'none';
   const hash = crypto.createHash('sha256');
-  for (const tool of tools) {
+  for (const tool of active) {
     hash.update(tool.name);
     hash.update('\0');
     hash.update(tool.description ?? '');
@@ -142,7 +143,7 @@ export class McpSessionEndpoint {
   }
 
   setTools(tools: readonly ToolSchema[] | undefined): void {
-    this.#tools = tools ?? [];
+    this.#tools = (tools ?? []).filter((t) => !t.deferLoading);
     this.#mcpToDsh.clear();
 
     const used = new Set<string>();
@@ -279,7 +280,7 @@ export class McpSessionEndpoint {
       sendResult({
         protocolVersion: requestedVersion,
         capabilities: { tools: {} },
-        serverInfo: { name: MCP_SERVER_NAME, version: '0.2.1' },
+        serverInfo: { name: MCP_SERVER_NAME, version: '0.2.2' },
       });
       return;
     }

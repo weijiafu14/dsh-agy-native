@@ -1043,3 +1043,121 @@ test('straggler parallel tools across batchWindowMs, multimodal tool images, mid
     fs.rmSync(tmpCache, { recursive: true, force: true });
   }
 });
+
+test('AgyAcpAdapter converts 300KB non-Gemini conversation into native SQLite trajectory and reloads MCP tools in-place on ToolSearch activation', { timeout: 10000 }, async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-db-sync-'));
+  const prevStateDir = process.env.AGY_STATE_DIR;
+  process.env.AGY_STATE_DIR = tmpRoot;
+
+  const cfg = resolveAgyAcpConfig({
+    agyPath: FAKE_AGY_PATH,
+    batchWindowMs: 10,
+    cacheDir: tmpRoot,
+    workingDirectory: tmpRoot,
+  });
+  const adapter = new AgyAcpAdapter({ getConfig: () => cfg });
+
+  try {
+    // 1. Simulate a 300KB multi-turn DeepSeek/Claude conversation switching mid-session to agy-acp
+    const bigToolDump = 'LOG_LINE_0123456789ABCDEF\n'.repeat(12_500); // ~325 KB (> 192 KB agy prompt cap!)
+    const toolsInitial = [
+      { name: 'tool_search', description: 'Search tools', parameters: { type: 'object' } },
+      { name: 'read', description: 'Read file', parameters: { type: 'object' } },
+      { name: 'activated_later', description: 'Deferred', parameters: { type: 'object' }, deferLoading: true },
+    ];
+
+    const historyFromClaude = [
+      { id: 'u-c1', role: 'user', content: [{ type: 'text', text: 'Inspect big build log' }], source: { kind: 'user' } },
+      {
+        id: 'a-c1',
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'Claude thinking...' },
+          { type: 'text', text: 'Reading log now.' },
+          { type: 'tool-call', id: 'toolu_claude_1', name: 'read', arguments: '{"file_path":"build.log"}' },
+        ],
+        source: { provider: 'anthropic', model: 'claude-sonnet-4-5' },
+      },
+      {
+        id: 't-c1',
+        role: 'tool',
+        toolCallId: 'toolu_claude_1',
+        content: [{ type: 'text', text: bigToolDump }],
+        source: { kind: 'tool' },
+      },
+      {
+        id: 'a-c2',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Build log analyzed on Claude.' }],
+        source: { provider: 'anthropic', model: 'claude-sonnet-4-5' },
+      },
+      {
+        id: 'u-now',
+        role: 'user',
+        content: [{ type: 'text', text: 'INSPECT_DB_TRAJECTORY Switched to Gemini — keep going!' }],
+        source: { kind: 'user' },
+      },
+    ];
+
+    const turn1Chunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-cross-model-1',
+        messages: historyFromClaude,
+        tools: toolsInitial,
+      }),
+    );
+    const turn1Finish = turn1Chunks.find((c) => c.type === 'finish');
+    const turn1Text = turn1Chunks.find((c) => c.type === 'block-end' && c.block.type === 'text').block.text;
+    const report1 = JSON.parse(turn1Text);
+
+    // Verify 325KB history went into SQLite steps (14,15,15,132,15), NOT into session/prompt!
+    assert.equal(report1.dbStepTypes, '14,15,15,132,15');
+    assert.equal(report1.hasHistoryTagInPrompt, false);
+    assert.ok(report1.promptBytes < 2000, `Expected tiny incremental prompt, got ${report1.promptBytes} bytes`);
+    assert.equal(report1.mcpTools, 'tool_search,read', 'deferLoading tool must not be eagerly mounted');
+    assert.match(report1.promptText, /Switched to Gemini — keep going!/);
+
+    // 2. Next turn: DSH upper-layer ToolSearch activates `activated_later` (deferLoading removed) ->
+    //    must reload MCP catalog via session/load on the EXACT SAME acpSessionId!
+    const aGem1 = {
+      id: 'a-gem-1',
+      role: 'assistant',
+      content: [{ type: 'text', text: turn1Text }],
+      source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: turn1Finish.replayState },
+    };
+    const toolsAfterSearch = toolsInitial.map(({ deferLoading: _d, ...rest }) => rest);
+
+    const turn2Chunks = await collectChunks(
+      adapter.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-cross-model-1',
+        messages: [
+          ...historyFromClaude,
+          aGem1,
+          { id: 'u-next', role: 'user', content: [{ type: 'text', text: 'INSPECT_DB_TRAJECTORY Check newly activated tool' }], source: { kind: 'user' } },
+        ],
+        tools: toolsAfterSearch,
+      }),
+    );
+    const turn2Finish = turn2Chunks.find((c) => c.type === 'finish');
+    const report2 = JSON.parse(
+      turn2Chunks.find((c) => c.type === 'block-end' && c.block.type === 'text').block.text,
+    );
+
+    assert.equal(
+      turn2Finish.replayState.response.acpSessionId,
+      turn1Finish.replayState.response.acpSessionId,
+      'Activating a ToolSearch tool must preserve the exact same ACP session via session/load',
+    );
+    assert.equal(report2.mcpTools, 'tool_search,read,activated_later');
+    assert.equal(report2.dbStepCount, 5);
+  } finally {
+    if (prevStateDir === undefined) delete process.env.AGY_STATE_DIR;
+    else process.env.AGY_STATE_DIR = prevStateDir;
+    await adapter.dispose();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});

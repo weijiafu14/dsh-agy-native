@@ -6,8 +6,12 @@ import path from 'node:path';
 
 import {
   AGY_PRE_CHECKPOINT_CONTEXT_CAP,
+  AGY_STEP_TYPE_MCP_TOOL,
+  AGY_STEP_TYPE_PLANNER_RESPONSE,
+  AGY_STEP_TYPE_USER_INPUT,
   AgyModelCatalog,
   DEFAULT_MAX_CONTEXT_WINDOW,
+  GEMINI_DUMMY_THOUGHT_SIGNATURE,
   LoopbackMcpBridge,
   McpSessionEndpoint,
   buildCatalogEntries,
@@ -18,17 +22,20 @@ import {
   classifyInBandAgyApiError,
   computeHistoryPrefixDigest,
   computeToolsFingerprint,
+  convertDshMessagesToAgySteps,
   createInFlightTurnUsageState,
   createSanitizedAgyEnv,
   encodeMcpToolName,
   estimateIntermediateStepUsage,
   formatHarnessGuidelines,
+  hydrateAgyConversationDb,
   isAmbientContextMessage,
   planSessionSync,
   reconcileFinalStepUsage,
   resolveAgyAcpConfig,
   resolveAgyBinary,
   sanitizeMcpToolArguments,
+  splitMessagesForTrajectorySync,
   supportsProcessPerSession,
   truncateToolOutputUtf8,
 } from '../dist/core.js';
@@ -1277,4 +1284,212 @@ test('planSessionSync reuses warm and resumable ACP sessions for purpose=compact
   });
   assert.equal(resumeDecision.kind, 'resume-incremental');
   assert.equal(resumeDecision.resumeAcpSessionId, 'acp-s1');
+});
+
+test('planSessionSync preserves ACP session via resume-incremental on legacy anchors with dshSessionId and on mid-session tool updates', () => {
+  const u1 = { id: 'u1', role: 'user', content: [{ type: 'text', text: 'First' }] };
+  const u2 = { id: 'u2', role: 'user', content: [{ type: 'text', text: 'Second' }] };
+  const fpA = computeToolsFingerprint([{ name: 'read', description: 'Read', parameters: { type: 'object' } }]);
+  const fpB = computeToolsFingerprint([
+    { name: 'read', description: 'Read', parameters: { type: 'object' } },
+    { name: 'grep', description: 'Grep', parameters: { type: 'object' } },
+  ]);
+
+  // 1. Legacy persisted anchor without dshSessionId resumes when DSH passes dshSessionId
+  const legacyAnchor = {
+    id: 'a-legacy-real',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Done' }],
+    source: {
+      replayState: {
+        response: {
+          version: 1,
+          acpSessionId: 'acp-legacy-1',
+          rawModelId: 'gemini-4-carbon-medium',
+          syncedMessageCount: 2,
+          toolsFingerprint: fpA,
+        },
+      },
+    },
+  };
+  const legacyWithDshId = planSessionSync({
+    messages: [u1, legacyAnchor, u2],
+    activeAcpSessionId: undefined,
+    currentToolsFingerprint: fpA,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    dshSessionId: 'session-live-abc',
+  });
+  assert.equal(legacyWithDshId.kind, 'resume-incremental');
+  assert.equal(legacyWithDshId.resumeAcpSessionId, 'acp-legacy-1');
+
+  // 2. Warm session where DSH upper-layer ToolSearch activates a new tool reloads MCP via resume-incremental (never discards ACP session!)
+  const modernAnchor = {
+    id: 'a-mod-1',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Done' }],
+    source: {
+      replayState: {
+        response: {
+          version: 1,
+          dshSessionId: 'session-live-abc',
+          acpSessionId: 'acp-warm-1',
+          rawModelId: 'gemini-4-carbon-medium',
+          syncedMessageCount: 2,
+          toolsFingerprint: fpA,
+        },
+      },
+    },
+  };
+  const warmToolAdded = planSessionSync({
+    messages: [u1, modernAnchor, u2],
+    activeAcpSessionId: 'acp-warm-1',
+    lastToolsFingerprint: fpA,
+    currentToolsFingerprint: fpB,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    dshSessionId: 'session-live-abc',
+  });
+  assert.equal(warmToolAdded.kind, 'resume-incremental');
+  assert.equal(warmToolAdded.resumeAcpSessionId, 'acp-warm-1');
+
+  // 3. Fork with a different dshSessionId still isolates cleanly
+  const forked = planSessionSync({
+    messages: [u1, modernAnchor, u2],
+    activeAcpSessionId: undefined,
+    currentToolsFingerprint: fpA,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    dshSessionId: 'session-forked-xyz',
+  });
+  assert.equal(forked.kind, 'cold-full-replay');
+});
+
+test('McpSessionEndpoint and computeToolsFingerprint filter deferLoading tools until activated by DSH', () => {
+  const toolsInitial = [
+    { name: 'tool_search', description: 'Search tools', parameters: { type: 'object' } },
+    { name: 'heavy_db_query', description: 'Deferred tool', parameters: { type: 'object' }, deferLoading: true },
+  ];
+  const toolsActivated = [
+    { name: 'tool_search', description: 'Search tools', parameters: { type: 'object' } },
+    { name: 'heavy_db_query', description: 'Deferred tool', parameters: { type: 'object' } },
+  ];
+
+  const endpoint = new McpSessionEndpoint({
+    token: 'tok',
+    url: 'http://127.0.0.1:9999/mcp',
+    maxToolOutputBytes: 10000,
+    batchWindowMs: 0,
+    onDispose() {},
+  });
+
+  endpoint.setTools(toolsInitial);
+  assert.deepEqual(endpoint.bridgeToolNames, ['tool_search']);
+  assert.equal(endpoint.isAllowedPermissionRequest('mcp_dsh_heavy_db_query'), false);
+
+  endpoint.setTools(toolsActivated);
+  assert.deepEqual(endpoint.bridgeToolNames, ['tool_search', 'heavy_db_query']);
+  assert.equal(endpoint.isAllowedPermissionRequest('mcp_dsh_heavy_db_query'), true);
+  assert.notEqual(computeToolsFingerprint(toolsInitial), computeToolsFingerprint(toolsActivated));
+});
+
+test('convertDshMessagesToAgySteps & hydrateAgyConversationDb convert non-Gemini history into native agy SQLite trajectory', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-traj-unit-'));
+  const dbPath = path.join(tmpDir, 'sess-1.db');
+
+  try {
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE trajectory_meta (trajectory_id text PRIMARY KEY, cascade_id text, trajectory_type integer, source integer);
+      CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, has_subtrajectory numeric NOT NULL DEFAULT false, metadata blob, error_details blob, permissions blob, task_details blob, render_info blob, step_payload blob, step_format integer NOT NULL DEFAULT 0);
+    `);
+    db.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 4, 17)').run('traj-unit-1', 'sess-1');
+    db.close();
+
+    const messages = [
+      { role: 'system', content: [{ type: 'text', text: 'You are a coding agent powered by deepseek-v4.\n\nAlways verify exit codes.' }] },
+      { role: 'developer', content: [{ type: 'text', text: 'Context OS workspace card' }] },
+      { role: 'user', content: [{ type: 'text', text: 'Clock snapshot' }], source: { kind: 'time-context', form: 'snapshot' } },
+      { role: 'user', content: [{ type: 'text', text: 'Inspect alpha and beta.' }], source: { kind: 'user' } },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'Foreign DeepSeek chain-of-thought that must be stripped' },
+          { type: 'text', text: 'Checking both tools.' },
+          { type: 'tool-call', id: 'tc-ok-1', name: 'read', arguments: '{"file_path":"a.txt"}' },
+          { type: 'tool-call', id: 'tc-err-2', name: 'bash', arguments: '{"command":"false"}' },
+          { type: 'tool-call', id: 'tc-orphan-aborted', name: 'bash', arguments: '{"command":"aborted"}' },
+        ],
+      },
+      { role: 'tool', toolCallId: 'tc-ok-1', content: [{ type: 'text', text: 'ALPHA_CONTENT' }] },
+      { role: 'tool', toolCallId: 'tc-err-2', isError: true, content: [{ type: 'text', text: 'exit code 1' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'Another foreign reasoning block' },
+          { type: 'text', text: 'Alpha succeeded and bash failed.' },
+        ],
+      },
+      { role: 'user', content: [{ type: 'text', text: 'Now summarize on Gemini.' }], source: { kind: 'user' } },
+    ];
+
+    const split = splitMessagesForTrajectorySync(messages);
+    assert.equal(split.hasPriorTurns, true);
+    assert.equal(split.tailMessages.length, 1);
+
+    const steps = convertDshMessagesToAgySteps({
+      historyMessages: split.historyMessages,
+      tools: [
+        { name: 'read', description: 'Read', parameters: { type: 'object' } },
+        { name: 'bash', description: 'Bash', parameters: { type: 'object' } },
+      ],
+      bridgeToolNames: ['read', 'bash'],
+    });
+
+    // Expected logical steps:
+    // 0: user-input (coalesced guidelines + developer + runtime + user)
+    // 1: planner-text ("Checking both tools." — split from tool-calls, reasoning stripped!)
+    // 2: planner-tool-batch (tc-ok-1, tc-err-2; tc-orphan-aborted skipped!)
+    // 3: planner-text ("Alpha succeeded and bash failed.")
+    assert.deepEqual(
+      steps.map((s) => s.kind),
+      ['user-input', 'planner-text', 'planner-tool-batch', 'planner-text'],
+    );
+    assert.match(steps[0].text, /<workspace_guidelines>/);
+    assert.doesNotMatch(steps[0].text, /powered by deepseek-v4/);
+    assert.ok(steps[0].text.indexOf('Clock snapshot') < steps[0].text.indexOf('Inspect alpha and beta.'));
+    assert.equal(steps[2].calls.length, 2, 'Orphaned aborted tool call must be skipped');
+    assert.equal(steps[2].calls[0].qualifiedAcpName, 'mcp_dsh_read');
+    assert.match(steps[2].calls[1].outputText, /\[Tool execution error\]/);
+
+    const { insertedRows } = hydrateAgyConversationDb({
+      dbPath,
+      sessionId: 'sess-1',
+      steps,
+    });
+    // 1 user + 1 planner-text + 1 planner-tool-batch + 2 mcp-tool results + 1 final planner-text = 6 SQLite rows
+    assert.equal(insertedRows, 6);
+
+    const verifyDb = new DatabaseSync(dbPath);
+    const rows = verifyDb.prepare('SELECT idx, step_type, step_payload FROM steps ORDER BY idx ASC').all();
+    verifyDb.close();
+    assert.deepEqual(
+      rows.map((r) => r.step_type),
+      [
+        AGY_STEP_TYPE_USER_INPUT,
+        AGY_STEP_TYPE_PLANNER_RESPONSE,
+        AGY_STEP_TYPE_PLANNER_RESPONSE,
+        AGY_STEP_TYPE_MCP_TOOL,
+        AGY_STEP_TYPE_MCP_TOOL,
+        AGY_STEP_TYPE_PLANNER_RESPONSE,
+      ],
+    );
+    const allBytes = Buffer.concat(rows.map((r) => Buffer.from(r.step_payload)));
+    assert.ok(allBytes.includes(Buffer.from(GEMINI_DUMMY_THOUGHT_SIGNATURE, 'utf8')));
+    assert.ok(!allBytes.includes(Buffer.from('Foreign DeepSeek chain-of-thought', 'utf8')));
+    assert.ok(!allBytes.includes(Buffer.from('tc-orphan-aborted', 'utf8')));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

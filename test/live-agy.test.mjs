@@ -188,6 +188,80 @@ test(
       const call = ptc.find(c => c.type === 'block-end' && c.block.type === 'tool-call')?.block;
       assert.equal(call?.name, 'run_code');
       assert.match(JSON.parse(call.arguments).code, /lookup_magic_code/);
+
+      // Cross-model (>240KB non-Gemini history with foreign reasoning + orphaned call + parallel tool calls)
+      // converts into native agy SQLite trajectory via session/load with zero 192KB prompt truncation!
+      const hugePadding = 'BUILD_ARTIFACT_LINE_0123456789ABCDEF\n'.repeat(6_800); // ~245 KB > 192 KB
+      const crossModelMessages = [
+        {
+          id: 'cm-u1',
+          role: 'user',
+          content: [{ type: 'text', text: 'Read the vault key and build log.' }],
+          source: { kind: 'user' },
+        },
+        {
+          id: 'cm-a1',
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'DeepSeek R1 reasoning that has no Google signature...' },
+            { type: 'text', text: 'Reading vault and build log in parallel.' },
+            { type: 'tool-call', id: 'ds_call_1', name: 'lookup_magic_code', arguments: '{"key":"vault"}' },
+            { type: 'tool-call', id: 'ds_call_2', name: 'lookup_magic_code', arguments: '{"key":"log"}' },
+            { type: 'tool-call', id: 'ds_call_orphan', name: 'lookup_magic_code', arguments: '{"key":"aborted"}' },
+          ],
+          source: { provider: 'deepseek', model: 'deepseek-v4' },
+        },
+        {
+          id: 'cm-t1',
+          role: 'tool',
+          toolCallId: 'ds_call_1',
+          content: [{ type: 'text', text: 'VAULT-SAPPHIRE-6104' }],
+          source: { kind: 'tool' },
+        },
+        {
+          id: 'cm-t2',
+          role: 'tool',
+          toolCallId: 'ds_call_2',
+          content: [{ type: 'text', text: hugePadding }],
+          source: { kind: 'tool' },
+        },
+        {
+          id: 'cm-a2',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Finished reading vault and 245KB build log.' }],
+          source: { provider: 'deepseek', model: 'deepseek-v4' },
+        },
+        {
+          id: 'cm-u2',
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'Without calling any tools, reply with BOTH the exact VAULT-... code from Turn 1 AND the token TAIL-7731.',
+            },
+          ],
+          source: { kind: 'user' },
+        },
+      ];
+
+      const cmChunks = await collectChunks(
+        adapter.stream({
+          provider: 'agy-acp',
+          model: 'gemini-3.8-flash',
+          reasoningEffort: 'low',
+          sessionId: 'live-cross-model-session',
+          messages: crossModelMessages,
+          tools,
+        }),
+      );
+      const cmFinish = cmChunks.find((c) => c.type === 'finish');
+      assert.equal(cmFinish?.reason.kind, 'stop');
+      const cmText = cmChunks
+        .filter((c) => c.type === 'block-end' && c.block.type === 'text')
+        .map((c) => c.block.text)
+        .join('');
+      assert.match(cmText, /VAULT-SAPPHIRE-6104/, 'Must recall Turn 1 tool output from hydrated SQLite trajectory');
+      assert.match(cmText, /TAIL-7731/, 'Current input after >240KB history must never be truncated');
     } finally {
       await adapter.dispose();
       fs.rmSync(tmpCache, { recursive: true, force: true });

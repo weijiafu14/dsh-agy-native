@@ -722,7 +722,7 @@ export function planSessionSync(opts: {
       opts.allowResumeFromReplay &&
       compAnchorIdx >= 0 &&
       compAnchorReplay?.acpSessionId &&
-      compAnchorReplay.dshSessionId === opts.dshSessionId &&
+      (!compAnchorReplay.dshSessionId || compAnchorReplay.dshSessionId === opts.dshSessionId) &&
       (!compAnchorReplay.toolsFingerprint ||
         compAnchorReplay.toolsFingerprint === opts.currentToolsFingerprint) &&
       !hasMutatedHistoryPrefix(
@@ -864,9 +864,9 @@ export function planSessionSync(opts: {
   const effectiveToolsFp = isWarmSession
     ? (opts.lastToolsFingerprint ?? anchorReplay?.toolsFingerprint)
     : anchorReplay?.toolsFingerprint;
-  if (effectiveToolsFp && effectiveToolsFp !== opts.currentToolsFingerprint) {
-    return { kind: 'cold-full-replay', reason: 'tool-declarations-changed' };
-  }
+  const toolsChanged = Boolean(
+    effectiveToolsFp && effectiveToolsFp !== opts.currentToolsFingerprint,
+  );
 
   const tailMessages = messages.slice(anchorIdx + 1);
   if (tailMessages.length === 0) {
@@ -890,7 +890,7 @@ export function planSessionSync(opts: {
 
   const priorSystemPrompt = extractSystemPrompt(messages, opts.explicitSystem, anchorIdx + 1);
 
-  if (isWarmSession) {
+  if (isWarmSession && !toolsChanged) {
     return {
       kind: 'warm-incremental',
       tailMessages,
@@ -898,21 +898,34 @@ export function planSessionSync(opts: {
     };
   }
 
-  // Forks can carry a parent's replay envelope. Rebuild from their own DSH history.
-  // A suspended tool turn also needs replay: its HTTP request died with the transport.
+  // Forks carry a parent's dshSessionId and must not mutate the parent's ACP session.
+  // Legacy envelopes recorded before dshSessionId existed (undefined) remain resumable.
+  // When active tool declarations change mid-session, `resume-incremental` closes the old
+  // per-session worker and reloads the same `acpSessionId` with the updated MCP catalog.
+  // A suspended tool turn still needs trajectory rebuild: its HTTP request died with the transport.
+  const sameOrLegacyDshSession =
+    !anchorReplay?.dshSessionId || anchorReplay.dshSessionId === opts.dshSessionId;
+  const resumableAcpSessionId = isWarmSession
+    ? opts.activeAcpSessionId
+    : opts.allowResumeFromReplay
+      ? anchorReplay?.acpSessionId
+      : undefined;
+
   if (
-    opts.allowResumeFromReplay &&
-    anchorReplay?.acpSessionId &&
-    anchorReplay.dshSessionId === opts.dshSessionId &&
+    resumableAcpSessionId &&
+    sameOrLegacyDshSession &&
     !messages[anchorIdx]!.content.some((block) => block.type === 'tool-call')
   ) {
     return {
       kind: 'resume-incremental',
-      resumeAcpSessionId: anchorReplay.acpSessionId,
+      resumeAcpSessionId: resumableAcpSessionId,
       tailMessages,
       priorSystemPrompt,
     };
   }
 
-  return { kind: 'cold-full-replay', reason: 'worker-restarted-without-resume' };
+  return {
+    kind: 'cold-full-replay',
+    reason: toolsChanged ? 'tool-declarations-changed' : 'worker-restarted-without-resume',
+  };
 }

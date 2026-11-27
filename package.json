@@ -1,6 +1,6 @@
 {
   "name": "dsh-agy-native",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "TOS-safe native DeepSeek Harness LLM adapter for Google AI Pro/Ultra subscriptions via the official Antigravity CLI (agy acp)",
   "type": "module",
   "license": "MIT",

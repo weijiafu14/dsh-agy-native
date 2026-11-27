@@ -70,6 +70,19 @@ export {
 } from './session-sync.js';
 
 export {
+  AGY_STEP_TYPE_MCP_TOOL,
+  AGY_STEP_TYPE_PLANNER_RESPONSE,
+  AGY_STEP_TYPE_USER_INPUT,
+  GEMINI_DUMMY_THOUGHT_SIGNATURE,
+  convertDshMessagesToAgySteps,
+  hydrateAgyConversationDb,
+  resolveAgyConversationDbPath,
+  splitMessagesForTrajectorySync,
+  type ConvertedAgyStep,
+  type ConvertedAgyToolCall,
+} from './trajectory-db.js';
+
+export {
   AgyWorkerPool,
   AgyWorkerSlot,
   IMPLICIT_CACHE_TTL_MS,

@@ -198,7 +198,7 @@ export class AcpWorkerClient {
       'initialize',
       {
         protocolVersion: 1,
-        clientInfo: { name: 'dsh-agy-native', version: '0.2.0' },
+        clientInfo: { name: 'dsh-agy-native', version: '0.2.2' },
         clientCapabilities: {},
       },
       this.#startupTimeoutMs,

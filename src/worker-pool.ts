@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { ToolCallId } from '@deepseek-ai/dsh-llm';
 import type {
   GenerateOptions,
@@ -23,7 +24,14 @@ import {
   planSessionSync,
   type ImageBytesLoader,
 } from './session-sync.js';
+import {
+  convertDshMessagesToAgySteps,
+  hydrateAgyConversationDb,
+  resolveAgyConversationDbPath,
+  splitMessagesForTrajectorySync,
+} from './trajectory-db.js';
 import type {
+  AcpPromptPart,
   AcpPromptResponse,
   AcpPromptUsage,
   AgyReplayMetadata,
@@ -73,6 +81,14 @@ class AsyncEventQueue<T> {
     return new Promise<IteratorResult<T>>((resolve) => {
       this.#waiters.push(resolve);
     });
+  }
+}
+
+async function waitForSqliteWalClear(dbPath: string, maxWaitMs = 800): Promise<void> {
+  const walPath = `${dbPath}-wal`;
+  const deadline = Date.now() + maxWaitMs;
+  while (fs.existsSync(walPath) && Date.now() < deadline) {
+    await new Promise<void>((r) => setTimeout(r, 25));
   }
 }
 
@@ -645,7 +661,7 @@ export class SessionRuntime {
             }
           };
 
-          let promptParts;
+          let promptParts: AcpPromptPart[] | undefined;
           if (syncPlan.kind === 'warm-incremental' || (syncPlan.kind === 'resume-incremental' && resumed)) {
             if (resumed || this.#activeRawModelId !== targetRawModelId) {
               await client.setModel(this.#activeAcpSessionId!, targetRawModelId);
@@ -664,13 +680,77 @@ export class SessionRuntime {
             }
           } else {
             targetRawModelId = await this.#openFreshSession(client, endpoint, options, cfg);
-            promptParts = await buildFullReplayPromptParts({
-              messages: options.messages,
-              systemPrompt,
-              bridgeToolNames: routingBridgeToolNames,
-              loadImage: this.#loadImage,
-              signal: options.signal,
-            });
+            const split = splitMessagesForTrajectorySync(options.messages);
+            let hydratedTrajectory = false;
+
+            if (split.hasPriorTurns && client.capabilities?.loadSession && this.#activeAcpSessionId) {
+              const freshSessionId = this.#activeAcpSessionId;
+              const dbPath = resolveAgyConversationDbPath(freshSessionId);
+              if (fs.existsSync(dbPath)) {
+                const convertedSteps = convertDshMessagesToAgySteps({
+                  historyMessages: split.historyMessages,
+                  explicitSystem: options.system,
+                  tools: options.tools,
+                  bridgeToolNames: routingBridgeToolNames ?? false,
+                });
+                if (convertedSteps.length > 0) {
+                  try {
+                    await client.closeSession(freshSessionId);
+                    await waitForSqliteWalClear(dbPath);
+                    hydrateAgyConversationDb({
+                      dbPath,
+                      sessionId: freshSessionId,
+                      steps: convertedSteps,
+                    });
+                    await client.loadSession({
+                      sessionId: freshSessionId,
+                      endpoint,
+                      cwd: cfg.workingDirectory,
+                    });
+                    await client.setModel(freshSessionId, targetRawModelId);
+                    this.#activeAcpSessionId = freshSessionId;
+                    this.#activeRawModelId = targetRawModelId;
+
+                    const priorSystemPrompt = extractSystemPrompt(
+                      options.messages,
+                      options.system,
+                      split.historyMessages.length,
+                    );
+                    promptParts = await buildIncrementalPromptParts({
+                      tailMessages: split.tailMessages,
+                      priorSystemPrompt,
+                      loadImage: this.#loadImage,
+                      signal: options.signal,
+                    });
+                    if (options.purpose !== 'compaction') {
+                      const routing = formatHarnessGuidelines(
+                        undefined,
+                        routingBridgeToolNames ?? false,
+                      );
+                      if (routing) promptParts.unshift({ type: 'text', text: routing });
+                    }
+                    hydratedTrajectory = true;
+                  } catch {
+                    targetRawModelId = await this.#openFreshSession(
+                      client,
+                      endpoint,
+                      options,
+                      cfg,
+                    );
+                  }
+                }
+              }
+            }
+
+            if (!promptParts) {
+              promptParts = await buildFullReplayPromptParts({
+                messages: options.messages,
+                systemPrompt,
+                bridgeToolNames: routingBridgeToolNames,
+                loadImage: this.#loadImage,
+                signal: options.signal,
+              });
+            }
           }
 
           const turnUsage = createInFlightTurnUsageState();

@@ -62,7 +62,7 @@ cd dsh-agy-native
 npm install
 npm test
 npm pack
-dsh plugin --profile web add -w ./dsh-agy-native-0.2.0.tgz
+dsh plugin --profile web add -w ./dsh-agy-native-0.2.2.tgz
 ```
 
 安装后在 DSH 模型选择器中选择 **Antigravity (Google AI Ultra / Pro)**，即可自由切换模型（如 `Gemini 4 Carbon`、`Gemini 4 Hydrogen`）及推理档位（`Low` / `Medium` / `High` / `XHigh`）。
@@ -88,7 +88,7 @@ dsh plugin --profile web add -w ./dsh-agy-native-0.2.0.tgz
 
 当本机安装的 `agy` CLI 支持 `--process-per-session` 时，适配器会自动启用该官方 ACP 参数，使每个新建 ACP 会话独立拉取自己的 HTTP MCP 工具目录（同时同会话内的多轮对话依然复用热会话）；旧版本二进制会自动保持原有启动参数。[官方 ACP 参数参考](https://antigravity.google/docs/ide/extensions/acp/#flags)
 
-在标准 DSH 会话中，模型会获得当前会话 `dsh` 桥接端实际注册的精确 Eager 工具名；在 PTC 会话中，外层调用为 `mcp_dsh_run_code`，程序内部则使用 DSH SDK 中的原始工具名。即使环境中存在同名的外部 MCP 服务器，ACP 权限校验也仅放行当前 `dsh` 桥接端已注册的工具，工具执行与审批继续完全由 DSH 接管。
+在标准 DSH 会话中，模型仅接收当前已激活（非 `deferLoading`）的 DSH 工具声明；当 DSH 上层在中途动态激活新工具（如 ToolSearch 或切换权限预设）时，适配器直接通过 `session/load` 原地刷新当前 ACP 会话的 MCP 工具目录，绝不丢弃已有会话历史。当从非 Gemini 模型（DeepSeek、Claude、OpenAI）中途切入、执行 `/compact` 或会话 Fork 时，历史轮次会通过协议转换直接写入原生 `agy` SQLite 会话轨迹再经 `session/load` 加载，`session/prompt` 仅发送当轮新输入，彻底避免 `agy` 单次请求 ~192 KB 截断。在 PTC 会话中，外层调用为 `mcp_dsh_run_code`，程序内部则使用 DSH SDK 中的原始工具名。即使环境中存在同名的外部 MCP 服务器，ACP 权限校验也仅放行当前 `dsh` 桥接端已注册的工具，工具执行与审批继续完全由 DSH 接管。
 
 ---
 
