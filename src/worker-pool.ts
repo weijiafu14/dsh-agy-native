@@ -79,43 +79,59 @@ class AsyncEventQueue<T> {
 export function mapAcpUsageToDsh(usage?: AcpPromptUsage): TokenUsage | undefined {
   if (!usage) return undefined;
   const inputTokens = Math.max(0, Math.round(usage.inputTokens ?? 0));
-  const outputTokens = Math.max(0, Math.round(usage.outputTokens ?? 0));
+  const rawOutput = Math.max(0, Math.round(usage.outputTokens ?? 0));
   const cacheReadTokens =
     typeof usage.cachedReadTokens === 'number'
       ? Math.max(0, Math.round(usage.cachedReadTokens))
-      : undefined;
+      : 0;
   const cacheWriteTokens =
     typeof usage.cachedWriteTokens === 'number'
       ? Math.max(0, Math.round(usage.cachedWriteTokens))
-      : undefined;
+      : 0;
   const reasoningTokens =
     typeof usage.thoughtTokens === 'number'
       ? Math.max(0, Math.round(usage.thoughtTokens))
       : undefined;
-  const totalTokens =
-    typeof usage.totalTokens === 'number'
-      ? Math.max(0, Math.round(usage.totalTokens))
-      : inputTokens + outputTokens + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0);
+  const knownPrompt = inputTokens + cacheReadTokens + cacheWriteTokens;
+  const rawTotal =
+    typeof usage.totalTokens === 'number' ? Math.max(0, Math.round(usage.totalTokens)) : undefined;
+  // Preserve @deepseek-ai/dsh-token-meter invariants:
+  // `reasoningTokens <= outputTokens` and `totalTokens === knownPrompt + outputTokens`.
+  const outputTokens =
+    reasoningTokens !== undefined &&
+    reasoningTokens > 0 &&
+    rawTotal !== undefined &&
+    rawTotal === knownPrompt + rawOutput + reasoningTokens
+      ? rawOutput + reasoningTokens
+      : Math.max(rawOutput, reasoningTokens ?? 0);
+  const totalTokens = knownPrompt + outputTokens;
 
   return {
     inputTokens,
     outputTokens,
     totalTokens,
-    ...(typeof cacheReadTokens === 'number' ? { cacheReadTokens } : {}),
-    ...(typeof cacheWriteTokens === 'number' ? { cacheWriteTokens } : {}),
+    cacheReadTokens,
+    cacheWriteTokens,
     ...(typeof reasoningTokens === 'number' ? { reasoningTokens } : {}),
   };
 }
+
+export const IMPLICIT_CACHE_TTL_MS = 3_300_000;
 
 export interface InFlightTurnUsageState {
   emittedInput: number;
   emittedOutput: number;
   emittedCacheRead: number;
   emittedCacheWrite: number;
+  emittedReasoning: number;
   emittedSteps: number;
   toolBatchCount: number;
   pendingStepUsed?: number;
   lastStepUsed?: number;
+  finalStepObservedUsed?: number;
+  compactionDetected?: boolean;
+  estimatedPrevTotalTokens?: number;
+  pendingInputDeltaTokens?: number;
 }
 
 export function createInFlightTurnUsageState(): InFlightTurnUsageState {
@@ -124,47 +140,84 @@ export function createInFlightTurnUsageState(): InFlightTurnUsageState {
     emittedOutput: 0,
     emittedCacheRead: 0,
     emittedCacheWrite: 0,
+    emittedReasoning: 0,
     emittedSteps: 0,
     toolBatchCount: 0,
   };
 }
 
+function estimatePromptPartsTokens(parts: readonly { type: string; text?: string }[]): number {
+  let chars = 0;
+  for (const part of parts) {
+    if (part.type === 'text' && part.text) {
+      chars += part.text.length;
+    } else {
+      chars += 1024;
+    }
+  }
+  return Math.max(1, Math.ceil(chars / 4));
+}
+
 /**
  * Estimate single-step `TokenUsage` for an intermediate tool-calling step (`j < K`)
- * from ACP's real-time `usage_update.used` count so DSH's context-occupancy meter
- * reflects single-step context pressure while preserving cumulative session totals.
+ * from ACP's real-time `usage_update.used` count (or prompt-delta fallback when omitted)
+ * so DSH's context-occupancy meter reflects single-step context pressure while preserving
+ * exact end-of-turn cumulative billing and cache-hit ratios.
  */
 export function estimateIntermediateStepUsage(opts: {
   stepUsedTokens: number;
   emittedOutputChars: number;
+  emittedThoughtChars?: number;
   cachedPromptBaseline: number;
-}): { usage: TokenUsage; nextCachedPromptBaseline: number } {
+  authoritative?: boolean;
+}): { usage: TokenUsage; nextCachedPromptBaseline: number; compacted: boolean } {
   const stepUsed = Math.max(0, Math.round(opts.stepUsedTokens));
-  const estOutput = Math.min(
-    Math.floor(stepUsed * 0.25),
-    Math.max(1, Math.ceil(Math.max(0, opts.emittedOutputChars) / 4)),
-  );
+  const estOutput =
+    stepUsed === 0
+      ? 0
+      : Math.min(
+          Math.floor(stepUsed * 0.25),
+          Math.max(1, Math.ceil(Math.max(0, opts.emittedOutputChars) / 4)),
+        );
+  const thoughtChars = Math.max(0, opts.emittedThoughtChars ?? 0);
+  const totalOutChars = Math.max(1, opts.emittedOutputChars);
+  const estReasoning =
+    thoughtChars > 0 && estOutput > 0
+      ? Math.min(estOutput, Math.max(1, Math.round((estOutput * thoughtChars) / totalOutChars)))
+      : 0;
   const stepPrompt = Math.max(0, stepUsed - estOutput);
   const baseline = Math.max(0, Math.round(opts.cachedPromptBaseline));
-  const stepCacheRead = Math.min(stepPrompt, baseline);
+
+  // Detect mid-session / mid-turn internal `agy` `CHECKPOINT` compaction where prompt size
+  // drops sharply (>30% drop from a >=16k baseline): the compacted summary invalidates the
+  // old prefix cache on its first step and establishes `stepPrompt` as the new baseline.
+  const compacted =
+    baseline >= 16_000 && stepPrompt > 0 && stepPrompt < Math.floor(baseline * 0.7);
+  const stepCacheRead = compacted ? 0 : Math.min(stepPrompt, baseline);
   const stepInput = stepPrompt - stepCacheRead;
-  const nextCachedPromptBaseline = Math.max(baseline, Math.floor(stepPrompt * 0.8));
+  // When `stepUsedTokens` came from an authoritative `usage_update` frame, anchor directly to
+  // `stepPrompt` so any prior heuristic overshoot cannot ratchet `#cachedPromptBaseline` upward.
+  const nextCachedPromptBaseline =
+    compacted || opts.authoritative ? stepPrompt : Math.max(baseline, stepPrompt);
 
   return {
     usage: {
       inputTokens: stepInput,
       outputTokens: estOutput,
-      totalTokens: stepUsed,
-      ...(stepCacheRead > 0 ? { cacheReadTokens: stepCacheRead } : {}),
+      totalTokens: stepPrompt + estOutput,
+      cacheReadTokens: stepCacheRead,
+      cacheWriteTokens: 0,
+      ...(opts.emittedThoughtChars !== undefined ? { reasoningTokens: estReasoning } : {}),
     },
     nextCachedPromptBaseline,
+    compacted,
   };
 }
 
 /**
  * Reconcile ACP's cumulative `session/prompt` end-of-turn usage against intermediate
  * step usages emitted during tool loops so that:
- * 1. Across steps `1..K`, `sum(step.usage)` equals ACP's cumulative turn totals;
+ * 1. Across steps `1..K`, `sum(step.usage)` equals ACP's cumulative turn totals (including cache hit %);
  * 2. Final step `K` reports only step `K`'s single-step prompt size (avoiding `K × context` 100% spikes).
  */
 export function reconcileFinalStepUsage(
@@ -186,7 +239,7 @@ export function reconcileFinalStepUsage(
   if (!turnState || totalSteps <= 1) {
     return {
       usage: full,
-      nextCachedPromptBaseline: Math.floor(fullPrompt * 0.85),
+      nextCachedPromptBaseline: fullPrompt,
     };
   }
 
@@ -203,20 +256,28 @@ export function reconcileFinalStepUsage(
     const stepCacheWrite = Math.round(fullCacheWrite * scale);
     const stepInput = Math.max(0, targetPrompt - stepCacheRead - stepCacheWrite);
     const stepOutput = Math.round(fullOutput / totalSteps);
+    const stepReasoning =
+      typeof full.reasoningTokens === 'number'
+        ? Math.min(stepOutput, Math.round(full.reasoningTokens / totalSteps))
+        : undefined;
     return {
       usage: {
         inputTokens: stepInput,
         outputTokens: stepOutput,
         totalTokens: targetPrompt + stepOutput,
-        ...(typeof full.cacheReadTokens === 'number' ? { cacheReadTokens: stepCacheRead } : {}),
-        ...(typeof full.cacheWriteTokens === 'number' ? { cacheWriteTokens: stepCacheWrite } : {}),
-        ...(typeof full.reasoningTokens === 'number'
-          ? { reasoningTokens: full.reasoningTokens }
-          : {}),
+        cacheReadTokens: stepCacheRead,
+        cacheWriteTokens: stepCacheWrite,
+        ...(stepReasoning !== undefined ? { reasoningTokens: stepReasoning } : {}),
       },
-      nextCachedPromptBaseline: Math.floor(targetPrompt * 0.85),
+      nextCachedPromptBaseline: targetPrompt,
     };
   }
+
+  const remOutput = Math.max(0, fullOutput - turnState.emittedOutput);
+  const finalObservedPrompt =
+    turnState.finalStepObservedUsed && turnState.finalStepObservedUsed > 0
+      ? Math.max(0, Math.round(turnState.finalStepObservedUsed - remOutput))
+      : undefined;
 
   const emittedPrompt =
     turnState.emittedInput + turnState.emittedCacheRead + turnState.emittedCacheWrite;
@@ -227,6 +288,26 @@ export function reconcileFinalStepUsage(
       turnState.lastStepUsed && turnState.lastStepUsed > 0
         ? Math.min(targetPrompt, Math.round(turnState.lastStepUsed))
         : Math.round(targetPrompt / (missedIntermediateSteps + 1));
+  }
+  // If `agy` executed a hidden internal `CHECKPOINT` summarization call during the turn,
+  // `fullPrompt - emittedPrompt` includes that hidden 500k call even though the post-checkpoint
+  // final step ran on a much smaller prompt (`finalObservedPrompt`). Clamp only on genuine
+  // checkpoint cliffs so normal sparse-update turns preserve 100% exact cumulative totals.
+  const avgEmittedStepPrompt =
+    turnState.emittedSteps > 0 ? emittedPrompt / turnState.emittedSteps : 0;
+  const checkpointCliff =
+    Boolean(turnState.compactionDetected) ||
+    (avgEmittedStepPrompt >= 16_000 &&
+      finalObservedPrompt !== undefined &&
+      finalObservedPrompt > 0 &&
+      finalObservedPrompt < Math.floor(avgEmittedStepPrompt * 0.7));
+  if (
+    checkpointCliff &&
+    finalObservedPrompt !== undefined &&
+    finalObservedPrompt > 0 &&
+    targetPrompt > Math.round(finalObservedPrompt * 1.25)
+  ) {
+    targetPrompt = finalObservedPrompt;
   }
 
   let remInput = Math.max(0, fullInput - turnState.emittedInput);
@@ -241,26 +322,49 @@ export function reconcileFinalStepUsage(
     remInput = Math.max(0, targetPrompt - remCacheRead - remCacheWrite);
   }
 
-  const remOutput = Math.max(0, fullOutput - turnState.emittedOutput);
+  // Prevent final-step `pressureTokens` from collapsing to 0 when intermediate heuristic sub-steps
+  // (e.g. split tool dispatches or mid-turn checkpoint resets) already over-emitted cumulative buckets.
+  const referenceSingleStepPrompt =
+    finalObservedPrompt ??
+    (turnState.lastStepUsed && turnState.lastStepUsed > remOutput
+      ? Math.round(turnState.lastStepUsed - remOutput)
+      : 0);
+  if (
+    referenceSingleStepPrompt > 0 &&
+    remInput + remCacheRead + remCacheWrite < Math.floor(referenceSingleStepPrompt * 0.5)
+  ) {
+    const cacheReadShare = fullPrompt > 0 ? fullCacheRead / fullPrompt : 0;
+    const cacheWriteShare = fullPrompt > 0 ? fullCacheWrite / fullPrompt : 0;
+    remCacheRead = Math.round(referenceSingleStepPrompt * cacheReadShare);
+    remCacheWrite = Math.round(referenceSingleStepPrompt * cacheWriteShare);
+    remInput = Math.max(0, referenceSingleStepPrompt - remCacheRead - remCacheWrite);
+  }
+
   const stepPrompt = remInput + remCacheRead + remCacheWrite;
+  const remReasoning =
+    typeof full.reasoningTokens === 'number'
+      ? Math.min(remOutput, Math.max(0, full.reasoningTokens - turnState.emittedReasoning))
+      : turnState.emittedSteps > 0
+        ? 0
+        : undefined;
+
+  const observedFinalPrompt =
+    finalObservedPrompt && finalObservedPrompt > 0
+      ? finalObservedPrompt
+      : turnState.lastStepUsed && turnState.lastStepUsed > remOutput
+        ? Math.max(stepPrompt, Math.round(turnState.lastStepUsed - remOutput))
+        : stepPrompt;
 
   return {
     usage: {
       inputTokens: remInput,
       outputTokens: remOutput,
       totalTokens: stepPrompt + remOutput,
-      ...(typeof full.cacheReadTokens === 'number' || remCacheRead > 0
-        ? { cacheReadTokens: remCacheRead }
-        : {}),
-      ...(typeof full.cacheWriteTokens === 'number' || remCacheWrite > 0
-        ? { cacheWriteTokens: remCacheWrite }
-        : {}),
-      ...(typeof full.reasoningTokens === 'number'
-        ? { reasoningTokens: full.reasoningTokens }
-        : {}),
+      cacheReadTokens: remCacheRead,
+      cacheWriteTokens: remCacheWrite,
+      ...(remReasoning !== undefined ? { reasoningTokens: remReasoning } : {}),
     },
-    nextCachedPromptBaseline:
-      fullCacheRead > 0 || stepPrompt > 0 ? Math.floor(stepPrompt * 0.85) : 0,
+    nextCachedPromptBaseline: stepPrompt > 0 || fullCacheRead > 0 ? observedFinalPrompt : 0,
   };
 }
 
@@ -397,7 +501,9 @@ export class SessionRuntime {
     this.#clearIdleTimer();
     this.#busy = true;
     const now = Date.now();
-    if (now - this.#lastUsedAt > 270_000) {
+    // Cloud Code implicit prompt caches on warm ACP sessions routinely survive 15–55 minutes.
+    // Clearing at 4.5 minutes caused irreversible `uncachedInputTokens` spikes on step 1 of resumed loops.
+    if (now - this.#lastUsedAt > IMPLICIT_CACHE_TTL_MS) {
       this.#cachedPromptBaseline = 0;
     }
     this.#lastUsedAt = now;
@@ -422,8 +528,12 @@ export class SessionRuntime {
         currentToolsFingerprint: toolsFp,
         lastHistoryPrefixDigest: this.#lastHistoryPrefixDigest,
         pendingToolCallIds: pendingIds,
-        allowResumeFromReplay: cfg.resumeSessions && !!options.sessionId && options.purpose === undefined,
+        allowResumeFromReplay:
+          cfg.resumeSessions &&
+          !!options.sessionId &&
+          (options.purpose === undefined || options.purpose === 'compaction'),
         dshSessionId: options.sessionId,
+        purpose: options.purpose,
       });
 
       if (syncPlan.kind !== 'resolve-pending-tools') {
@@ -463,6 +573,7 @@ export class SessionRuntime {
           if (used > 0 && this.#inFlightTurnUsage) {
             this.#inFlightTurnUsage.pendingStepUsed = used;
             this.#inFlightTurnUsage.lastStepUsed = used;
+            this.#inFlightTurnUsage.finalStepObservedUsed = used;
           }
         },
       };
@@ -485,6 +596,7 @@ export class SessionRuntime {
         if (syncPlan.kind === 'resolve-pending-tools' && this.#inFlightPrompt) {
           client.setStreamCallbacks(this.#activeAcpSessionId!, callbacks);
           this.#attachPromptCompletion(this.#inFlightPrompt, queue);
+          let resolvedChars = 0;
           for (const res of syncPlan.resolutions) {
             const content = await buildMcpToolResultContent({
               content: res.content,
@@ -492,10 +604,19 @@ export class SessionRuntime {
               loadImage: this.#loadImage,
               signal: options.signal,
             });
+            for (const item of content) {
+              resolvedChars += item.type === 'text' ? item.text.length : 1024;
+            }
             endpoint.resolveToolCall(res.toolCallId, {
               content,
               isError: res.isError,
             });
+          }
+          if (this.#inFlightTurnUsage) {
+            this.#inFlightTurnUsage.pendingInputDeltaTokens = Math.max(
+              1,
+              Math.ceil(resolvedChars / 4),
+            );
           }
         } else {
           const routingBridgeToolNames =
@@ -503,19 +624,41 @@ export class SessionRuntime {
               ? undefined
               : endpoint.bridgeToolNames;
 
+          let latestAnchorMeta: AgyReplayMetadata | undefined;
+          for (let i = options.messages.length - 1; i >= 0; i--) {
+            const candidate = extractReplayMetadata(options.messages[i]!);
+            if (candidate) {
+              latestAnchorMeta = candidate;
+              break;
+            }
+          }
+          const restoreBaselineFromAnchor = (acpSessionId: string) => {
+            if (
+              this.#cachedPromptBaseline === 0 &&
+              latestAnchorMeta?.acpSessionId === acpSessionId &&
+              typeof latestAnchorMeta.cachedPromptBaseline === 'number' &&
+              latestAnchorMeta.cachedPromptBaseline > 0 &&
+              typeof latestAnchorMeta.baselineUpdatedAt === 'number' &&
+              now - latestAnchorMeta.baselineUpdatedAt <= IMPLICIT_CACHE_TTL_MS
+            ) {
+              this.#cachedPromptBaseline = latestAnchorMeta.cachedPromptBaseline;
+            }
+          };
+
           let promptParts;
           if (syncPlan.kind === 'warm-incremental' || (syncPlan.kind === 'resume-incremental' && resumed)) {
             if (resumed || this.#activeRawModelId !== targetRawModelId) {
               await client.setModel(this.#activeAcpSessionId!, targetRawModelId);
               this.#activeRawModelId = targetRawModelId;
             }
+            restoreBaselineFromAnchor(this.#activeAcpSessionId!);
             promptParts = await buildIncrementalPromptParts({
               tailMessages: syncPlan.tailMessages,
               priorSystemPrompt: syncPlan.priorSystemPrompt,
               loadImage: this.#loadImage,
               signal: options.signal,
             });
-            if (resumed) {
+            if (resumed && options.purpose !== 'compaction') {
               const routing = formatHarnessGuidelines(undefined, routingBridgeToolNames ?? false);
               if (routing) promptParts.unshift({ type: 'text', text: routing });
             }
@@ -530,7 +673,10 @@ export class SessionRuntime {
             });
           }
 
-          this.#inFlightTurnUsage = createInFlightTurnUsageState();
+          const turnUsage = createInFlightTurnUsageState();
+          turnUsage.estimatedPrevTotalTokens = this.#cachedPromptBaseline;
+          turnUsage.pendingInputDeltaTokens = estimatePromptPartsTokens(promptParts);
+          this.#inFlightTurnUsage = turnUsage;
           if (options.signal?.aborted) throw options.signal.reason;
           client.setStreamCallbacks(this.#activeAcpSessionId!, callbacks);
           const promptPromise = client.prompt(
@@ -539,12 +685,25 @@ export class SessionRuntime {
             cfg.requestTimeoutMs > 0 ? cfg.requestTimeoutMs : undefined,
           );
           this.#inFlightPrompt = promptPromise;
+          promptPromise.then(
+            () => {
+              if (this.#inFlightPrompt === promptPromise) {
+                this.#inFlightPrompt = undefined;
+              }
+            },
+            () => {
+              if (this.#inFlightPrompt === promptPromise) {
+                this.#inFlightPrompt = undefined;
+              }
+            },
+          );
           this.#attachPromptCompletion(promptPromise, queue);
         }
 
         // Stream events out as DSH StreamChunks
         let nextBlockIndex = 0;
         let stepOutputChars = 0;
+        let stepThoughtChars = 0;
         let openBlock:
           | { index: number; type: 'reasoning' | 'text'; text: string }
           | undefined;
@@ -577,6 +736,12 @@ export class SessionRuntime {
             syncedMessageCount: options.messages.length + 1,
             toolsFingerprint: toolsFp,
             historyPrefixDigest,
+            ...(this.#cachedPromptBaseline > 0
+              ? {
+                  cachedPromptBaseline: this.#cachedPromptBaseline,
+                  baselineUpdatedAt: Date.now(),
+                }
+              : {}),
           };
           this.#lastToolsFingerprint = toolsFp;
           this.#lastHistoryPrefixDigest = historyPrefixDigest;
@@ -598,6 +763,7 @@ export class SessionRuntime {
             }
             openBlock.text += ev.text;
             stepOutputChars += ev.text.length;
+            stepThoughtChars += ev.text.length;
             yield { type: 'reasoning-delta', index: openBlock.index, text: ev.text };
             continue;
           }
@@ -647,20 +813,50 @@ export class SessionRuntime {
             const turnUsage = this.#inFlightTurnUsage;
             if (turnUsage) {
               turnUsage.toolBatchCount += 1;
-              if (turnUsage.pendingStepUsed !== undefined && turnUsage.pendingStepUsed > 0) {
-                const stepUsed = turnUsage.pendingStepUsed;
-                turnUsage.pendingStepUsed = undefined;
-                const { usage: stepUsage, nextCachedPromptBaseline } =
+              const estOutTokens = Math.max(1, Math.ceil(stepOutputChars / 4));
+              const fallbackStepUsed =
+                (turnUsage.estimatedPrevTotalTokens ?? this.#cachedPromptBaseline) +
+                (turnUsage.pendingInputDeltaTokens ?? 1) +
+                estOutTokens;
+              const hasAuthoritativeUsed =
+                turnUsage.pendingStepUsed !== undefined && turnUsage.pendingStepUsed > 0;
+              const stepUsed = hasAuthoritativeUsed
+                ? turnUsage.pendingStepUsed!
+                : fallbackStepUsed;
+              turnUsage.pendingStepUsed = undefined;
+              turnUsage.finalStepObservedUsed = undefined;
+              turnUsage.pendingInputDeltaTokens = 0;
+
+              if (stepUsed > 0) {
+                const { usage: stepUsage, nextCachedPromptBaseline, compacted } =
                   estimateIntermediateStepUsage({
                     stepUsedTokens: stepUsed,
                     emittedOutputChars: stepOutputChars,
+                    emittedThoughtChars: stepThoughtChars,
                     cachedPromptBaseline: this.#cachedPromptBaseline,
+                    authoritative: hasAuthoritativeUsed,
                   });
+                if (compacted) {
+                  turnUsage.compactionDetected = true;
+                }
                 this.#cachedPromptBaseline = nextCachedPromptBaseline;
+                const stepPromptTokens =
+                  stepUsage.inputTokens +
+                  (stepUsage.cacheReadTokens ?? 0) +
+                  (stepUsage.cacheWriteTokens ?? 0);
+                const visibleOutTokens = Math.max(
+                  0,
+                  stepUsage.outputTokens - (stepUsage.reasoningTokens ?? 0),
+                );
+                // Reasoning (`thought`) tokens are not re-injected verbatim as raw prompt text
+                // on subsequent steps; exclude them so fallback steps never drift upward.
+                turnUsage.estimatedPrevTotalTokens = stepPromptTokens + visibleOutTokens;
+                turnUsage.lastStepUsed = stepUsed;
                 turnUsage.emittedInput += stepUsage.inputTokens;
                 turnUsage.emittedOutput += stepUsage.outputTokens;
                 turnUsage.emittedCacheRead += stepUsage.cacheReadTokens ?? 0;
                 turnUsage.emittedCacheWrite += stepUsage.cacheWriteTokens ?? 0;
+                turnUsage.emittedReasoning += stepUsage.reasoningTokens ?? 0;
                 turnUsage.emittedSteps += 1;
                 yield { type: 'usage', usage: stepUsage };
               }
@@ -726,7 +922,7 @@ export class SessionRuntime {
         detachBatch();
         queue.close();
         if (this.#activeAcpSessionId) client.setStreamCallbacks(this.#activeAcpSessionId);
-        if (!delivered) {
+        if (!delivered || options.purpose === 'compaction') {
           endpoint.dispose();
           this.#endpoint = undefined;
           await this.#abortInFlightTurn(true);
@@ -820,16 +1016,28 @@ export class SessionRuntime {
 
   async #abortInFlightTurn(closeExistingSession: boolean): Promise<void> {
     this.#endpoint?.cancelAllPending('Turn superseded');
+    let settledInTime = true;
     if (this.#inFlightPrompt && this.#activeAcpSessionId && this.#client?.alive) {
+      settledInTime = false;
       this.#client.cancelPrompt(this.#activeAcpSessionId);
       await Promise.race([
-        this.#inFlightPrompt.catch(() => undefined),
-        new Promise<void>((r) => setTimeout(r, 500)),
+        this.#inFlightPrompt.then(
+          () => {
+            settledInTime = true;
+          },
+          () => {
+            settledInTime = true;
+          },
+        ),
+        new Promise<void>((r) => {
+          const timer = setTimeout(r, 2_500);
+          timer.unref?.();
+        }),
       ]);
     }
     this.#inFlightTurnUsage = undefined;
     this.#inFlightPrompt = undefined;
-    if (closeExistingSession) {
+    if (closeExistingSession || !settledInTime) {
       if (this.#activeAcpSessionId && this.#client?.alive) {
         await this.#client.closeSession(this.#activeAcpSessionId);
       }
@@ -918,8 +1126,12 @@ export class AgyWorkerPool {
   async *stream(options: GenerateOptions<string>): AsyncGenerator<StreamChunk> {
     if (options.signal?.aborted) throw options.signal.reason;
     await this.ensureCatalogLoaded();
-    let key: string | symbol = options.sessionId && options.purpose === undefined
-      ? String(options.sessionId) : Symbol('request');
+    const usesConversationSession =
+      Boolean(options.sessionId) &&
+      (options.purpose === undefined || options.purpose === 'compaction');
+    let key: string | symbol = usesConversationSession
+      ? String(options.sessionId)
+      : Symbol('request');
     // Unkeyed tool continuations can rejoin only another unkeyed request.
     if (typeof key === 'symbol' && options.purpose === undefined) {
       for (let i = options.messages.length - 1; i >= 0; i--) {

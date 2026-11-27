@@ -136,7 +136,10 @@ test('AgyAcpAdapter streams reasoning, parallel tool-calls, warm continuation, i
     assert.equal(step1Usage.usage.outputTokens + step2Usage.usage.outputTokens, 50);
     assert.equal((step1Usage.usage.cacheReadTokens ?? 0) + (step2Usage.usage.cacheReadTokens ?? 0), 400);
     assert.equal(step1Usage.usage.totalTokens + step2Usage.usage.totalTokens, 1450);
-    assert.equal(step2Usage.usage.reasoningTokens, 15);
+    assert.equal(
+      (step1Usage.usage.reasoningTokens ?? 0) + (step2Usage.usage.reasoningTokens ?? 0),
+      15,
+    );
     assert.ok(
       step2Usage.usage.inputTokens + (step2Usage.usage.cacheReadTokens ?? 0) < 1000,
       'Final step prompt pressure reflects step 2 alone rather than step1+step2 sum',
@@ -595,6 +598,187 @@ test('AgyAcpAdapter decomposes 6-step tool-loop usage so context occupancy stays
     assert.equal(sumPrompt, 1_118_400);
   } finally {
     await adapter.dispose();
+    fs.rmSync(tmpCache, { recursive: true, force: true });
+  }
+});
+
+test('AgyAcpAdapter emits valid per-step usage when agy omits usage_update and restores cachedPromptBaseline across session/load', async () => {
+  const tmpCache = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sparse-resume-test-'));
+  const cfg = resolveAgyAcpConfig({
+    agyPath: FAKE_AGY_PATH,
+    batchWindowMs: 10,
+    cacheDir: tmpCache,
+    resumeSessions: true,
+  });
+  const tools = [
+    { name: 'get_left', description: 'Left', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+  ];
+
+  const adapter1 = new AgyAcpAdapter({ getConfig: () => cfg });
+  const history = [
+    {
+      id: 'u-res-1',
+      role: 'user',
+      content: [{ type: 'text', text: 'Warm baseline turn 1' }],
+      source: { kind: 'user' },
+    },
+  ];
+
+  try {
+    // Turn 1 establishes cachedPromptBaseline = 1400 (1000 input + 400 cachedRead) and persists it in ReplayEnvelope
+    const t1Chunks = await collectChunks(
+      adapter1.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-resume-baseline',
+        messages: history,
+        tools,
+      }),
+    );
+    const t1Finish = t1Chunks.find((c) => c.type === 'finish');
+    assert.equal(t1Finish.replayState.response.cachedPromptBaseline, 1_400);
+    const t1Blocks = t1Chunks.filter((c) => c.type === 'block-end').map((c) => c.block);
+    history.push({
+      id: 'a-res-1',
+      role: 'assistant',
+      content: t1Blocks,
+      source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: t1Finish.replayState },
+    });
+  } finally {
+    await adapter1.dispose();
+  }
+
+  // Restart adapter -> Turn 2 resumes via session/load and runs a 4-step loop with ZERO intermediate usage_update frames
+  const adapter2 = new AgyAcpAdapter({ getConfig: () => cfg });
+  try {
+    history.push({
+      id: 'u-res-2',
+      role: 'user',
+      content: [{ type: 'text', text: 'Run CALL_SPARSE_USAGE_LOOP after restart' }],
+      source: { kind: 'user' },
+    });
+
+    const stepUsages = [];
+    let finishKind = 'tool-calls';
+    let step = 0;
+    while (finishKind === 'tool-calls' && step++ < 10) {
+      const chunks = await collectChunks(
+        adapter2.stream({
+          provider: 'agy-acp',
+          model: 'gemini-4-carbon',
+          sessionId: 'dsh-resume-baseline',
+          messages: history,
+          tools,
+        }),
+      );
+      const usageChunk = chunks.find((c) => c.type === 'usage');
+      assert.ok(usageChunk, `Expected usage chunk on sparse step ${step}`);
+      stepUsages.push(usageChunk.usage);
+
+      const finish = chunks.find((c) => c.type === 'finish');
+      finishKind = finish.reason.kind;
+      const blocks = chunks.filter((c) => c.type === 'block-end').map((c) => c.block);
+      history.push({
+        id: `a-res-2-${step}`,
+        role: 'assistant',
+        content: blocks,
+        source: { provider: 'agy-acp', model: 'gemini-4-carbon', replayState: finish.replayState },
+      });
+      if (finishKind === 'tool-calls') {
+        for (const tc of blocks.filter((b) => b.type === 'tool-call')) {
+          history.push({
+            id: `t-res-2-${step}`,
+            role: 'tool',
+            toolCallId: tc.id,
+            content: [{ type: 'text', text: `res-${step}` }],
+            source: { kind: 'tool' },
+          });
+        }
+      }
+    }
+
+    assert.equal(finishKind, 'stop');
+    assert.equal(stepUsages.length, 4);
+    assert.equal(
+      stepUsages[0].cacheReadTokens,
+      1_400,
+      'Step 1 after session/load within TTL must restore cachedPromptBaseline=1400 instead of 0',
+    );
+    assert.equal(stepUsages.reduce((s, u) => s + u.inputTokens, 0), 8_200);
+    assert.equal(stepUsages.reduce((s, u) => s + (u.cacheReadTokens ?? 0), 0), 16_500);
+    assert.equal(stepUsages.reduce((s, u) => s + u.outputTokens, 0), 450);
+
+    // Compaction (`purpose: 'compaction'`) MUST reuse the existing warm ACP session with `tools`
+    // 100% intact (preserving KV cache & sending only the incremental directive, zero cold replay!),
+    // even when DSH's compaction selection omits the retained recent tail!
+    const warmSessionBeforeCompact = history[history.length - 1].source.replayState.response.acpSessionId;
+    // Select only Turn 1 (`history.slice(0, 2)`) as the shadowed span while Turn 2 (`CALL_SPARSE_USAGE_LOOP`) is retained!
+    const compactionMessages = [
+      ...history.slice(0, 2),
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'ECHO_PROMPT You are now acting as a compaction engine. Output only checkpoint text.' }],
+      },
+    ];
+
+    const compactChunks = await collectChunks(
+      adapter2.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-resume-baseline',
+        purpose: 'compaction',
+        messages: compactionMessages,
+        tools,
+      }),
+    );
+    const compactFinish = compactChunks.find((c) => c.type === 'finish');
+    assert.equal(compactFinish.reason.kind, 'stop');
+    const compactText = compactChunks.find((c) => c.type === 'block-end' && c.block.type === 'text').block.text;
+    assert.match(
+      compactText,
+      new RegExp(`Session=${warmSessionBeforeCompact} Turn=3`),
+      'Compaction must run incrementally on the existing warm ACP session (hitting KV cache), never opening a cold session',
+    );
+    assert.doesNotMatch(
+      compactText,
+      /<conversation_history>/,
+      'Warm compaction must never cold-replay conversation_history into a single prompt',
+    );
+    assert.match(compactText, /\[Compaction boundary: Condense ONLY the earlier conversation span/);
+    assert.match(compactText, /You are now acting as a compaction engine/);
+
+    // Next post-compaction assistant turn starts cleanly on a fresh ACP session with the compacted checkpoint
+    const postCompactChunks = await collectChunks(
+      adapter2.stream({
+        provider: 'agy-acp',
+        model: 'gemini-4-carbon',
+        sessionId: 'dsh-resume-baseline',
+        messages: [
+          {
+            id: 'ckpt-1',
+            role: 'user',
+            content: [{ type: 'text', text: '<compacted-summary>Condensed Turn 1</compacted-summary>' }],
+            source: { kind: 'user' },
+          },
+          ...history.slice(2),
+          {
+            id: 'u-res-3',
+            role: 'user',
+            content: [{ type: 'text', text: 'Continue after compaction' }],
+            source: { kind: 'user' },
+          },
+        ],
+        tools,
+      }),
+    );
+    const postCompactFinish = postCompactChunks.find((c) => c.type === 'finish');
+    assert.notEqual(
+      postCompactFinish.replayState.response.acpSessionId,
+      warmSessionBeforeCompact,
+      'Post-compaction conversation must open a clean ACP session without compaction prompt residue',
+    );
+  } finally {
+    await adapter2.dispose();
     fs.rmSync(tmpCache, { recursive: true, force: true });
   }
 });

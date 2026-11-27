@@ -5,13 +5,16 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  AGY_PRE_CHECKPOINT_CONTEXT_CAP,
   AgyModelCatalog,
+  DEFAULT_MAX_CONTEXT_WINDOW,
   LoopbackMcpBridge,
   McpSessionEndpoint,
   buildCatalogEntries,
   buildFullReplayPromptParts,
   buildIncrementalPromptParts,
   buildMcpToolResultContent,
+  clampEffectiveContextWindow,
   classifyInBandAgyApiError,
   computeHistoryPrefixDigest,
   computeToolsFingerprint,
@@ -1011,8 +1014,12 @@ test('reconcileFinalStepUsage preserves exact cumulative billing while keeping f
 
   assert.ok(finalUsage);
   const all = [...emitted, finalUsage];
-  const totalPrompt = all.reduce((s, u) => s + u.inputTokens + (u.cacheReadTokens ?? 0), 0);
+  const totalInput = all.reduce((s, u) => s + u.inputTokens, 0);
+  const totalCacheRead = all.reduce((s, u) => s + (u.cacheReadTokens ?? 0), 0);
+  const totalPrompt = totalInput + totalCacheRead;
   const totalOut = all.reduce((s, u) => s + u.outputTokens, 0);
+  assert.equal(totalInput, 19_223, 'Cumulative uncached input must match ACP exact total without 0.8x inflation');
+  assert.equal(totalCacheRead, 1_089_736, 'Cumulative cache read must match ACP exact total without clamping loss');
   assert.equal(totalPrompt, 19_223 + 1_089_736);
   assert.equal(totalOut, 3_745);
 
@@ -1062,4 +1069,212 @@ test('cold replay loads only current images and keeps consecutive teammate repor
   assert.doesNotMatch(history, /report|pixels/);
   assert.match(current, /Programmer report[\s\S]*Reviewer report[\s\S]*\[pixels\][\s\S]*Coordinator report/);
   assert.equal(current.match(/<user_message>/g)?.length, 3);
+});
+
+test('multi-step cold-start and heavy-reasoning turns satisfy DSH token-meter invariants and preserve exact cache-hit ratio', () => {
+  const turnState = createInFlightTurnUsageState();
+  let baseline = 0;
+  const steps = [];
+
+  for (const [used, outChars, thoughtChars] of [
+    [22_400, 1_600, 1_200],
+    [30_500, 2_000, 1_600],
+    [45_600, 2_400, 2_000],
+  ]) {
+    turnState.toolBatchCount += 1;
+    const { usage, nextCachedPromptBaseline } = estimateIntermediateStepUsage({
+      stepUsedTokens: used,
+      emittedOutputChars: outChars,
+      emittedThoughtChars: thoughtChars,
+      cachedPromptBaseline: baseline,
+    });
+    baseline = nextCachedPromptBaseline;
+    turnState.emittedInput += usage.inputTokens;
+    turnState.emittedOutput += usage.outputTokens;
+    turnState.emittedCacheRead += usage.cacheReadTokens ?? 0;
+    turnState.emittedCacheWrite += usage.cacheWriteTokens ?? 0;
+    turnState.emittedReasoning += usage.reasoningTokens ?? 0;
+    turnState.emittedSteps += 1;
+    steps.push(usage);
+  }
+
+  turnState.lastStepUsed = 55_300;
+  turnState.finalStepObservedUsed = 55_300;
+  const { usage: finalStep, nextCachedPromptBaseline: nextTurnBaseline } = reconcileFinalStepUsage(
+    {
+      inputTokens: 56_500,
+      outputTokens: 1_800,
+      cachedReadTokens: 95_200,
+      cachedWriteTokens: 0,
+      thoughtTokens: 1_450,
+      totalTokens: 153_500,
+    },
+    turnState,
+  );
+
+  assert.ok(finalStep);
+  steps.push(finalStep);
+
+  for (const [idx, u] of steps.entries()) {
+    assert.equal(typeof u.cacheReadTokens, 'number', `Step ${idx + 1} must define cacheReadTokens`);
+    assert.equal(typeof u.cacheWriteTokens, 'number', `Step ${idx + 1} must define cacheWriteTokens`);
+    assert.equal(typeof u.reasoningTokens, 'number', `Step ${idx + 1} must define reasoningTokens`);
+    assert.ok(
+      u.reasoningTokens <= u.outputTokens,
+      `Step ${idx + 1} reasoningTokens (${u.reasoningTokens}) must not exceed outputTokens (${u.outputTokens})`,
+    );
+    assert.equal(
+      u.totalTokens,
+      u.inputTokens + u.cacheReadTokens + u.cacheWriteTokens + u.outputTokens,
+      `Step ${idx + 1} totalTokens must equal knownPrompt + outputTokens`,
+    );
+  }
+
+  assert.equal(steps.reduce((s, u) => s + u.inputTokens, 0), 56_500);
+  assert.equal(steps.reduce((s, u) => s + u.cacheReadTokens, 0), 95_200);
+  assert.equal(steps.reduce((s, u) => s + u.outputTokens, 0), 1_800);
+  assert.ok(nextTurnBaseline >= 54_000, `Next turn baseline (${nextTurnBaseline}) should retain full final prompt`);
+});
+
+test('AgyModelCatalog caps Gemini 1M contextWindow to 500k by default so DSH compaction preempts agy silent CHECKPOINT', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cap-test-'));
+  try {
+    assert.equal(DEFAULT_MAX_CONTEXT_WINDOW, 500_000);
+    assert.equal(AGY_PRE_CHECKPOINT_CONTEXT_CAP, 500_000);
+    assert.equal(clampEffectiveContextWindow(1_048_576, 500_000), 500_000);
+    assert.equal(clampEffectiveContextWindow(200_000, 500_000), 200_000);
+    assert.equal(clampEffectiveContextWindow(1_048_576, 0), 1_048_576);
+
+    let dynamicCap = 500_000;
+    const catalog = new AgyModelCatalog({
+      cacheDir: tmpDir,
+      getMaxContextWindow: () => dynamicCap,
+    });
+    catalog.update([
+      { modelId: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+      { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (High)' },
+      { modelId: 'claude-sonnet-5.5', name: 'Claude Sonnet 5.5' },
+    ]);
+    catalog.recordContextWindow('gemini-4-carbon-medium', 1_048_576);
+
+    assert.equal(catalog.toResolvedModelInfo('agy-acp', 'gemini-4-carbon').context.contextWindow, 500_000);
+    assert.equal(catalog.toResolvedModelInfo('agy-acp', 'claude-sonnet-5.5').context.contextWindow, 200_000);
+
+    dynamicCap = 0; // Uncapped
+    assert.equal(catalog.toResolvedModelInfo('agy-acp', 'gemini-4-carbon').context.contextWindow, 1_048_576);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('estimateIntermediateStepUsage & reconcileFinalStepUsage handle agy mid-turn CHECKPOINT cliff and prevent 0-pressure collapse', () => {
+  const turnState = createInFlightTurnUsageState();
+  // Step 1 hits 495k context before agy triggers hidden 500k CHECKPOINT
+  turnState.toolBatchCount += 1;
+  const s1 = estimateIntermediateStepUsage({
+    stepUsedTokens: 495_000,
+    emittedOutputChars: 1_200,
+    cachedPromptBaseline: 480_000,
+    authoritative: true,
+  });
+  assert.equal(s1.compacted, false);
+  turnState.emittedInput += s1.usage.inputTokens;
+  turnState.emittedOutput += s1.usage.outputTokens;
+  turnState.emittedCacheRead += s1.usage.cacheReadTokens ?? 0;
+  turnState.emittedSteps += 1;
+
+  // Step 2 drops sharply to 85k after internal CHECKPOINT summarization
+  turnState.toolBatchCount += 1;
+  const s2 = estimateIntermediateStepUsage({
+    stepUsedTokens: 85_000,
+    emittedOutputChars: 800,
+    cachedPromptBaseline: s1.nextCachedPromptBaseline,
+    authoritative: true,
+  });
+  assert.equal(s2.compacted, true);
+  assert.equal(s2.usage.cacheReadTokens, 0);
+  turnState.emittedInput += s2.usage.inputTokens;
+  turnState.emittedOutput += s2.usage.outputTokens;
+  turnState.emittedSteps += 1;
+
+  // Final step runs at 90k observed context, even though cumulative turn prompt includes hidden 500k checkpoint call
+  turnState.lastStepUsed = 90_000;
+  turnState.finalStepObservedUsed = 90_000;
+  const { usage: finalUsage, nextCachedPromptBaseline } = reconcileFinalStepUsage(
+    {
+      inputTokens: 210_000,
+      outputTokens: 3_000,
+      cachedReadTokens: 960_000,
+      cachedWriteTokens: 0,
+      totalTokens: 1_173_000,
+    },
+    turnState,
+  );
+  assert.ok(finalUsage);
+  const finalPressure = finalUsage.inputTokens + (finalUsage.cacheReadTokens ?? 0);
+  assert.ok(finalPressure >= 80_000 && finalPressure <= 95_000, `Final pressure (${finalPressure}) must match post-checkpoint ~88k`);
+  assert.ok(nextCachedPromptBaseline >= 80_000 && nextCachedPromptBaseline <= 95_000);
+});
+
+test('planSessionSync reuses warm and resumable ACP sessions for purpose=compaction with tools intact', () => {
+  const toolsFp = computeToolsFingerprint([{ name: 'read', description: 'Read file', parameters: {} }]);
+  const u1 = { id: 'u1', role: 'user', content: [{ type: 'text', text: 'First task' }], source: { kind: 'user' } };
+  const a1Digest = computeHistoryPrefixDigest([u1]);
+  const a1 = {
+    id: 'a1',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Completed first task anchor' }],
+    source: {
+      provider: 'agy-acp',
+      model: 'gemini-4-carbon',
+      replayState: {
+        response: {
+          version: 1,
+          dshSessionId: 'dsh-s1',
+          acpSessionId: 'acp-s1',
+          rawModelId: 'gemini-4-carbon-medium',
+          syncedMessageCount: 2,
+          toolsFingerprint: toolsFp,
+          historyPrefixDigest: a1Digest,
+        },
+      },
+    },
+  };
+  const u2 = { id: 'u2', role: 'user', content: [{ type: 'text', text: 'Retained tail turn' }], source: { kind: 'user' } };
+  const a2 = { id: 'a2', role: 'assistant', content: [{ type: 'text', text: 'Retained tail answer' }], source: { provider: 'agy-acp', model: 'gemini-4-carbon' } };
+  const fullSessionDigest = computeHistoryPrefixDigest([u1, a1, u2, a2]);
+  const directive = {
+    role: 'user',
+    content: [{ type: 'text', text: 'You are now acting as a compaction engine.' }],
+  };
+
+  // Warm session with retained tail (`[u2, a2]` omitted from compaction input): must stay warm-incremental!
+  const warmDecision = planSessionSync({
+    messages: [u1, a1, directive],
+    activeAcpSessionId: 'acp-s1',
+    lastToolsFingerprint: toolsFp,
+    currentToolsFingerprint: toolsFp,
+    lastHistoryPrefixDigest: fullSessionDigest,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    dshSessionId: 'dsh-s1',
+    purpose: 'compaction',
+  });
+  assert.equal(warmDecision.kind, 'warm-incremental');
+  assert.equal(warmDecision.tailMessages.length, 1);
+  assert.match(warmDecision.tailMessages[0].content[0].text, /\[Compaction boundary:/);
+  assert.match(warmDecision.tailMessages[0].content[0].text, /Completed first task anchor/);
+
+  // Restarted worker (`activeAcpSessionId === undefined`): must resume `acp-s1` via session/load!
+  const resumeDecision = planSessionSync({
+    messages: [u1, a1, directive],
+    activeAcpSessionId: undefined,
+    currentToolsFingerprint: toolsFp,
+    pendingToolCallIds: new Set(),
+    allowResumeFromReplay: true,
+    dshSessionId: 'dsh-s1',
+    purpose: 'compaction',
+  });
+  assert.equal(resumeDecision.kind, 'resume-incremental');
+  assert.equal(resumeDecision.resumeAcpSessionId, 'acp-s1');
 });

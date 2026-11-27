@@ -26,9 +26,12 @@ export {
 } from './binary.js';
 
 export {
+  AGY_PRE_CHECKPOINT_CONTEXT_CAP,
   AgyModelCatalog,
   buildCatalogEntries,
+  clampEffectiveContextWindow,
   defaultContextWindowForModel,
+  type AgyModelCatalogOptions,
 } from './catalog.js';
 
 export {
@@ -69,6 +72,7 @@ export {
 export {
   AgyWorkerPool,
   AgyWorkerSlot,
+  IMPLICIT_CACHE_TTL_MS,
   createInFlightTurnUsageState,
   estimateIntermediateStepUsage,
   mapAcpUsageToDsh,
@@ -79,6 +83,7 @@ export {
 export { AgyAcpAdapter } from './adapter.js';
 export {
   Config,
+  DEFAULT_MAX_CONTEXT_WINDOW,
   DEFAULT_PROVIDER_ID,
   DEFAULT_PROVIDER_NAME,
   resolveAgyAcpConfig,

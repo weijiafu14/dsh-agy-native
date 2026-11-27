@@ -165,24 +165,26 @@ rl.on('line', async (line) => {
       .join('\n');
     const imagePart = prompt.find((p) => p.type === 'image');
 
-    send({
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: { sessionUpdate: 'usage_update', used: 512, size: 1048576 },
-      },
-    });
-
-    send({
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: {
-          sessionUpdate: 'agent_thought_chunk',
-          content: { type: 'text', text: 'Thinking step...' },
+    if (!textJoined.includes('CALL_SPARSE_USAGE_LOOP')) {
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 512, size: 1048576 },
         },
-      },
-    });
+      });
+
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_thought_chunk',
+            content: { type: 'text', text: 'Thinking step...' },
+          },
+        },
+      });
+    }
 
     if (textJoined.includes('INSPECT_CURRENT_INPUT')) {
       const current = textJoined.split('<current_input>').at(-1);
@@ -369,6 +371,60 @@ rl.on('line', async (line) => {
             cachedWriteTokens: 0,
             thoughtTokens: 1_200,
             totalTokens: 1_122_000,
+          },
+        },
+      });
+      return;
+    } else if (textJoined.includes('CALL_SPARSE_USAGE_LOOP') && sess.mcpServer) {
+      // Simulate 3 tool steps where `agy` omits intermediate `usage_update` frames completely!
+      for (let i = 1; i <= 3; i++) {
+        send({
+          method: 'session/update',
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_thought_chunk',
+              content: { type: 'text', text: `Sparse thinking ${i}...` },
+            },
+          },
+        });
+        const r = await callMcp(sess.mcpServer, 'tools/call', {
+          name: 'get_left',
+          arguments: { q: `sparse-${i}` },
+        });
+        if (sess.cancelled || r?.error || !r?.result) {
+          send({ id: msg.id, result: { stopReason: 'cancelled' } });
+          return;
+        }
+      }
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: { sessionUpdate: 'usage_update', used: 8_800, size: 1048576 },
+        },
+      });
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Sparse loop complete' },
+          },
+        },
+      });
+      send({
+        id: msg.id,
+        result: {
+          stopReason: 'end_turn',
+          usage: {
+            inputTokens: 8_200,
+            outputTokens: 450,
+            cachedReadTokens: 16_500,
+            cachedWriteTokens: 0,
+            thoughtTokens: 200,
+            totalTokens: 25_150,
           },
         },
       });

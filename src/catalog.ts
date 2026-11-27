@@ -26,11 +26,32 @@ const EFFORT_PATTERN = EFFORT_ORDER.join('|');
 const EFFORT_SUFFIX_RE = new RegExp(`^(.+)-(${EFFORT_PATTERN})$`, 'i');
 const PAREN_EFFORT_NAME_RE = new RegExp(`\\s*\\((${EFFORT_PATTERN})\\)\\s*$`, 'i');
 
-export function defaultContextWindowForModel(modelId: string): number {
+/**
+ * Default effective context window cap advertised to DSH so DSH's own visible compaction
+ * (`0.8 × 500k = 400k`) runs cleanly before `agy` hits its silent ~500k internal `CHECKPOINT`.
+ */
+export const AGY_PRE_CHECKPOINT_CONTEXT_CAP = 500_000;
+
+export function clampEffectiveContextWindow(
+  rawWindow: number,
+  maxContextWindow = AGY_PRE_CHECKPOINT_CONTEXT_CAP,
+): number {
+  const safeRaw = Math.max(1, Math.round(rawWindow));
+  if (maxContextWindow > 0) {
+    return Math.min(safeRaw, Math.round(maxContextWindow));
+  }
+  return safeRaw;
+}
+
+export function defaultContextWindowForModel(
+  modelId: string,
+  maxContextWindow = AGY_PRE_CHECKPOINT_CONTEXT_CAP,
+): number {
   const lower = modelId.toLowerCase();
-  if (lower.startsWith('gemini-')) return 1_048_576;
-  if (lower.startsWith('claude-')) return 200_000;
-  return 131_072;
+  let raw = 131_072;
+  if (lower.startsWith('gemini-')) raw = 1_048_576;
+  else if (lower.startsWith('claude-')) raw = 200_000;
+  return clampEffectiveContextWindow(raw, maxContextWindow);
 }
 
 function chooseDefaultEffort(
@@ -54,6 +75,7 @@ function chooseDefaultEffort(
 export function buildCatalogEntries(
   rawModels: readonly AcpAvailableModel[],
   observedContextWindows?: ReadonlyMap<string, number>,
+  maxContextWindow = AGY_PRE_CHECKPOINT_CONTEXT_CAP,
 ): CatalogModelEntry[] {
   interface DraftGroup {
     familyId: string;
@@ -115,10 +137,11 @@ export function buildCatalogEntries(
         group.firstEffort ?? 'medium',
       );
       const defaultRawId = sortedEfforts.get(defaultEffort) ?? group.rawItems[0]!.modelId;
-      const contextWindow =
+      const rawContextWindow =
         observedContextWindows?.get(defaultRawId) ??
         observedContextWindows?.get(group.familyId) ??
-        defaultContextWindowForModel(group.familyId);
+        defaultContextWindowForModel(group.familyId, 0);
+      const contextWindow = clampEffectiveContextWindow(rawContextWindow, maxContextWindow);
 
       entries.push({
         id: group.familyId,
@@ -130,8 +153,9 @@ export function buildCatalogEntries(
       });
     } else {
       const raw = group.rawItems[0]!;
-      const contextWindow =
-        observedContextWindows?.get(raw.modelId) ?? defaultContextWindowForModel(raw.modelId);
+      const rawContextWindow =
+        observedContextWindows?.get(raw.modelId) ?? defaultContextWindowForModel(raw.modelId, 0);
+      const contextWindow = clampEffectiveContextWindow(rawContextWindow, maxContextWindow);
       entries.push({
         id: raw.modelId,
         name: raw.name || raw.modelId,
@@ -154,6 +178,11 @@ function tierBadge(tier?: AcpSubscriptionTier): LlmModelBadge | undefined {
   return { text: tier.name, tone: 'neutral' };
 }
 
+export interface AgyModelCatalogOptions {
+  cacheDir?: string;
+  getMaxContextWindow?: () => number;
+}
+
 /**
  * In-memory and disk-backed catalog of models discovered from official `agy acp`.
  */
@@ -161,8 +190,13 @@ export class AgyModelCatalog {
   #snapshot?: CatalogSnapshot;
   readonly #contextWindows = new Map<string, number>();
   readonly #cacheFilePath?: string;
+  readonly #getMaxContextWindow: () => number;
 
-  constructor(cacheDir?: string) {
+  constructor(opts?: string | AgyModelCatalogOptions) {
+    const cacheDir = typeof opts === 'string' ? opts : opts?.cacheDir;
+    this.#getMaxContextWindow =
+      (typeof opts === 'object' && opts?.getMaxContextWindow) ||
+      (() => AGY_PRE_CHECKPOINT_CONTEXT_CAP);
     const baseDir = cacheDir ?? path.join(os.homedir(), '.dsh', 'cache');
     this.#cacheFilePath = path.join(baseDir, 'dsh-agy-native-catalog.json');
     this.#loadFromDisk();
@@ -182,13 +216,21 @@ export class AgyModelCatalog {
     if (this.#snapshot) {
       this.#snapshot = {
         ...this.#snapshot,
-        entries: buildCatalogEntries(this.#snapshot.rawModels, this.#contextWindows),
+        entries: buildCatalogEntries(
+          this.#snapshot.rawModels,
+          this.#contextWindows,
+          this.#getMaxContextWindow(),
+        ),
       };
     }
   }
 
   update(rawModels: readonly AcpAvailableModel[], tier?: AcpSubscriptionTier): CatalogSnapshot {
-    const entries = buildCatalogEntries(rawModels, this.#contextWindows);
+    const entries = buildCatalogEntries(
+      rawModels,
+      this.#contextWindows,
+      this.#getMaxContextWindow(),
+    );
     const next: CatalogSnapshot = {
       updatedAt: Date.now(),
       tier: tier ?? this.#snapshot?.tier,
@@ -250,6 +292,7 @@ export class AgyModelCatalog {
   }
 
   toResolvedModelInfo(provider: string, model: string): LlmResolvedModelInfo {
+    const maxWin = this.#getMaxContextWindow();
     const entries = this.#snapshot?.entries ?? [];
     const family = entries.find((e) => e.id === model);
     if (family) {
@@ -258,6 +301,15 @@ export class AgyModelCatalog {
         name: EFFORT_LABELS[slug].name,
         description: EFFORT_LABELS[slug].description,
       }));
+      const defaultRawId =
+        (family.defaultEffort ? family.effortToRawModelId.get(family.defaultEffort) : undefined) ??
+        family.standaloneRawModelId ??
+        family.id;
+      const rawWindow =
+        this.#contextWindows.get(defaultRawId) ??
+        this.#contextWindows.get(family.id) ??
+        defaultContextWindowForModel(family.id, 0);
+      const contextWindow = clampEffectiveContextWindow(rawWindow, maxWin);
       return {
         provider,
         id: family.id,
@@ -265,7 +317,7 @@ export class AgyModelCatalog {
         ...(family.description ? { description: family.description } : {}),
         inputModalities: ['text', 'image'] as const,
         systemPromptUpdate: 'in-history' as const,
-        context: { contextWindow: family.contextWindow },
+        context: { contextWindow },
         ...(efforts.length > 0
           ? {
               reasoning: {
@@ -281,8 +333,8 @@ export class AgyModelCatalog {
 
     // Raw model ID passed directly (e.g. `gemini-4-carbon-medium` in subagent config)
     const raw = this.#snapshot?.rawModels.find((m) => m.modelId === model);
-    const contextWindow =
-      this.#contextWindows.get(model) ?? defaultContextWindowForModel(model);
+    const rawWindow = this.#contextWindows.get(model) ?? defaultContextWindowForModel(model, 0);
+    const contextWindow = clampEffectiveContextWindow(rawWindow, maxWin);
     return {
       provider,
       id: model,
@@ -308,7 +360,11 @@ export class AgyModelCatalog {
         updatedAt: parsed.updatedAt ?? Date.now(),
         tier: parsed.tier,
         rawModels: parsed.rawModels,
-        entries: buildCatalogEntries(parsed.rawModels, this.#contextWindows),
+        entries: buildCatalogEntries(
+          parsed.rawModels,
+          this.#contextWindows,
+          this.#getMaxContextWindow(),
+        ),
       };
     } catch {
       // Ignore corrupt cache files

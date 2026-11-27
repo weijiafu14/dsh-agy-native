@@ -631,8 +631,128 @@ export function planSessionSync(opts: {
   pendingToolCallIds: ReadonlySet<string>;
   allowResumeFromReplay: boolean;
   dshSessionId?: string;
+  purpose?: string;
 }): SessionSyncDecision {
   const { messages, pendingToolCallIds } = opts;
+
+  // Compaction (`purpose: 'compaction'`): reuse the existing warm (or resumable) ACP session with
+  // its full toolset intact so the entire conversation prefix hits Google's KV cache and only the
+  // trailing compaction directive is sent incrementally (avoiding cold-replay single-message limits).
+  if (
+    opts.purpose === 'compaction' &&
+    pendingToolCallIds.size === 0 &&
+    messages.length >= 2 &&
+    messages[messages.length - 1]!.role === 'user'
+  ) {
+    const directiveMsg = messages[messages.length - 1]!;
+    const directiveText = blocksToPlainText(directiveMsg.content).trim();
+    const cutoffMsg = messages[messages.length - 2]!;
+    const cutoffPlain =
+      cutoffMsg.role !== 'system' ? blocksToPlainText(cutoffMsg.content).trim() : '';
+    const cutoffSnippet =
+      cutoffPlain.length > 200 ? `...${cutoffPlain.slice(-200)}` : cutoffPlain;
+
+    let compAnchorIdx = -1;
+    let compAnchorReplay: AgyReplayMetadata | undefined;
+    for (let i = messages.length - 2; i >= 0; i--) {
+      const meta = extractReplayMetadata(messages[i]!);
+      if (meta) {
+        if (!opts.activeAcpSessionId || meta.acpSessionId === opts.activeAcpSessionId) {
+          compAnchorIdx = i;
+          compAnchorReplay = meta;
+          break;
+        }
+      }
+    }
+
+    const priorSystemPrompt = extractSystemPrompt(
+      messages,
+      opts.explicitSystem,
+      messages.length - 1,
+    );
+
+    if (opts.activeAcpSessionId) {
+      const effectiveToolsFp = opts.lastToolsFingerprint ?? compAnchorReplay?.toolsFingerprint;
+      const toolsMatch = !effectiveToolsFp || effectiveToolsFp === opts.currentToolsFingerprint;
+      const prefixIntact =
+        compAnchorIdx < 0 ||
+        !compAnchorReplay ||
+        !hasMutatedHistoryPrefix(
+          messages,
+          compAnchorIdx,
+          compAnchorReplay.historyPrefixDigest,
+          compAnchorReplay.historyPrefixDigest,
+          opts.explicitSystem,
+        );
+      if (toolsMatch && prefixIntact) {
+        const compactionSpanDigest = computeHistoryPrefixDigest(
+          messages,
+          messages.length - 1,
+          opts.explicitSystem,
+        );
+        const hasRetainedTailInSession = Boolean(
+          opts.lastHistoryPrefixDigest && opts.lastHistoryPrefixDigest !== compactionSpanDigest,
+        );
+        const scopePrefix =
+          hasRetainedTailInSession && cutoffSnippet
+            ? `[Compaction boundary: Condense ONLY the earlier conversation span up through the ${cutoffMsg.role} message ending with ${JSON.stringify(cutoffSnippet)}. Exclude any subsequent messages in this session, as newer messages are retained verbatim after the checkpoint.]\n\n`
+            : '';
+        const compactionUserMsg: RequestMessage = {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `${scopePrefix}${directiveText}\n\n(Important: Do not invoke any mcp_dsh_* tools; output ONLY the requested Markdown checkpoint text.)`,
+            },
+          ],
+        };
+        const unsyncedBeforeDirective =
+          !hasRetainedTailInSession &&
+          compAnchorIdx >= 0 &&
+          !messages[compAnchorIdx]!.content.some((b) => b.type === 'tool-call')
+            ? messages.slice(compAnchorIdx + 1, messages.length - 1)
+            : [];
+        return {
+          kind: 'warm-incremental',
+          tailMessages: [...unsyncedBeforeDirective, compactionUserMsg],
+          priorSystemPrompt,
+        };
+      }
+    } else if (
+      opts.allowResumeFromReplay &&
+      compAnchorIdx >= 0 &&
+      compAnchorReplay?.acpSessionId &&
+      compAnchorReplay.dshSessionId === opts.dshSessionId &&
+      (!compAnchorReplay.toolsFingerprint ||
+        compAnchorReplay.toolsFingerprint === opts.currentToolsFingerprint) &&
+      !hasMutatedHistoryPrefix(
+        messages,
+        compAnchorIdx,
+        compAnchorReplay.historyPrefixDigest,
+        compAnchorReplay.historyPrefixDigest,
+        opts.explicitSystem,
+      )
+    ) {
+      const scopePrefix = cutoffSnippet
+        ? `[Compaction boundary: Condense ONLY the earlier conversation span up through the ${cutoffMsg.role} message ending with ${JSON.stringify(cutoffSnippet)}. Exclude any subsequent messages in this session, as newer messages are retained verbatim after the checkpoint.]\n\n`
+        : '';
+      const compactionUserMsg: RequestMessage = {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `${scopePrefix}${directiveText}\n\n(Important: Do not invoke any mcp_dsh_* tools; output ONLY the requested Markdown checkpoint text.)`,
+          },
+        ],
+      };
+      return {
+        kind: 'resume-incremental',
+        resumeAcpSessionId: compAnchorReplay.acpSessionId,
+        tailMessages: [compactionUserMsg],
+        priorSystemPrompt,
+      };
+    }
+  }
 
   // 1. Mid-turn suspended MCP tool calls: match dispatched ToolResultMessages by toolCallId
   if (pendingToolCallIds.size > 0 && opts.activeAcpSessionId) {

@@ -4,6 +4,11 @@ import type { ResolvedAgyAcpConfig } from './types.js';
 
 export const DEFAULT_PROVIDER_ID = 'agy-acp';
 export const DEFAULT_PROVIDER_NAME = 'Antigravity (AGY ACP)';
+/**
+ * Cap advertised DSH `contextWindow` at 500k by default so DSH's visible compaction
+ * (`thresholdRatio = 0.8` -> 400k) preempts `agy`'s silent ~500k internal `CHECKPOINT` freeze.
+ */
+export const DEFAULT_MAX_CONTEXT_WINDOW = 500_000;
 
 export const Config = z.object({
   providerId: z
@@ -67,6 +72,13 @@ export const Config = z.object({
     .default(0)
     .volatile()
     .description('Optional UTF-8 byte cap per tool output over the MCP bridge (0 = unlimited; defer to DSH pagination and spill handling).'),
+  maxContextWindow: z
+    .natural()
+    .min(0)
+    .max(2097152)
+    .default(DEFAULT_MAX_CONTEXT_WINDOW)
+    .volatile()
+    .description('Effective context window cap advertised to DSH so DSH compaction runs before `agy` hits its silent ~500k internal checkpoint (0 = uncapped raw model window).'),
   resumeSessions: z
     .boolean()
     .default(true)
@@ -112,6 +124,11 @@ export function resolveAgyAcpConfig(raw: RawPluginConfig = {}): ResolvedAgyAcpCo
   const rawMaxBytes = Number(plain.maxToolOutputBytes ?? 0);
   const maxToolOutputBytes =
     Number.isFinite(rawMaxBytes) && rawMaxBytes > 0 ? Math.floor(rawMaxBytes) : 0;
+  const rawMaxContextWindow = Number(plain.maxContextWindow ?? DEFAULT_MAX_CONTEXT_WINDOW);
+  const maxContextWindow =
+    Number.isFinite(rawMaxContextWindow) && rawMaxContextWindow >= 0
+      ? Math.round(rawMaxContextWindow)
+      : DEFAULT_MAX_CONTEXT_WINDOW;
   const resumeSessions = plain.resumeSessions !== false;
   const cacheDir = typeof plain.cacheDir === 'string' ? plain.cacheDir : undefined;
 
@@ -125,6 +142,7 @@ export function resolveAgyAcpConfig(raw: RawPluginConfig = {}): ResolvedAgyAcpCo
     startupTimeoutMs,
     requestTimeoutMs,
     maxToolOutputBytes,
+    maxContextWindow,
     resumeSessions,
     cacheDir,
   };

@@ -36,7 +36,12 @@ export class AgyAcpAdapter extends LlmAdapter {
     super();
     this.#getConfig = opts.getConfig;
     const initialCfg = opts.getConfig();
-    this.#catalog = opts.catalog ?? new AgyModelCatalog(initialCfg.cacheDir);
+    this.#catalog =
+      opts.catalog ??
+      new AgyModelCatalog({
+        cacheDir: initialCfg.cacheDir,
+        getMaxContextWindow: () => this.#getConfig().maxContextWindow,
+      });
     this.#lastTierName = this.#catalog.tier?.name;
     this.#mcpBridge = opts.mcpBridge ?? new LoopbackMcpBridge();
     this.#onCatalogError = opts.onCatalogError;

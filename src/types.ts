@@ -117,6 +117,8 @@ export interface AgyReplayMetadata {
   lastAnchorId?: string;
   toolsFingerprint: string;
   historyPrefixDigest?: string;
+  cachedPromptBaseline?: number;
+  baselineUpdatedAt?: number;
 }
 
 /** Resolved runtime configuration for `AgyAcpAdapter`. */
@@ -132,6 +134,7 @@ export interface ResolvedAgyAcpConfig {
   startupTimeoutMs: number;
   requestTimeoutMs: number;
   maxToolOutputBytes: number;
+  maxContextWindow: number;
   resumeSessions: boolean;
   cacheDir?: string;
 }
